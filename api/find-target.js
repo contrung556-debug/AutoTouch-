@@ -14,13 +14,13 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { image, target, width, height, mime, key } = req.body || {};
+    const { image, target, width, height, mime, key, model: clientModel } = req.body || {};
     const apiKey = key || GEMINI_API_KEY;
     if (!image || !target || !apiKey || apiKey === "DÁN_KEY_VÀO_ĐÂY") {
       return res.status(400).json({ success: false, error: "Thiếu image, target hoặc key" });
     }
 
-    const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+    const model = clientModel || process.env.GEMINI_MODEL || "gemini-3.8-flash";
     const url =
       "https://generativelanguage.googleapis.com/v1beta/models/" +
       model + ":generateContent?key=" + apiKey;
