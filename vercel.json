@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/find-target.js": {
+      "maxDuration": 30
+    }
+  }
+}
