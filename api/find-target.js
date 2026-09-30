@@ -1,7 +1,7 @@
 const { GoogleGenAI } = require('@google/genai');
 
-// Khởi tạo Gemini (Lấy API Key từ biến môi trường của Vercel)
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// Khởi tạo Gemini với API Key được gán trực tiếp trong mã nguồn
+const ai = new GoogleGenAI({ apiKey: "AQ.Ab8RN6KSlwWgrkmf6K6ZsAc9lr9CivV9C122iYmzquAZHoHQDA" });
 
 export default async function handler(req, res) {
     if (req.method !== 'POST') {
