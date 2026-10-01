@@ -1,5 +1,3 @@
-import crypto from "crypto";
-
 // Vercel serverless giới hạn body ~4.5MB, nên đặt 4.5mb (không thể cao hơn).
 // Client nên nén ảnh sang JPEG / giảm kích thước trước khi gửi.
 export const config = {
@@ -55,13 +53,6 @@ function cleanJsonText(text) {
 function clip(s, max) {
   const str = String(s ?? "");
   return str.length > max ? str.slice(0, max) + "…" : str;
-}
-
-function safeEqual(a, b) {
-  const ba = Buffer.from(String(a || ""));
-  const bb = Buffer.from(String(b || ""));
-  if (ba.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ba, bb);
 }
 
 // Đọc kích thước + loại ảnh từ magic bytes (PNG hoặc JPEG).
@@ -126,26 +117,12 @@ export default async function handler(req, res) {
   }
 
   try {
-    // --- Xác thực ---
-    const secret = process.env.APP_SECRET;
-    if (!secret) {
-      return fail(res, 500, "Thiếu APP_SECRET trên server");
-    }
-    if (!safeEqual(req.headers["x-app-secret"], secret)) {
-      return fail(res, 401, "Không có quyền truy cập");
-    }
-
     const { image, goal, info, rules, history, model, key: clientKey } = req.body || {};
 
-    // Ưu tiên key do client gửi (dùng cá nhân); nếu không có thì lấy từ biến môi trường
-    const key =
-      (typeof clientKey === "string" && clientKey.trim()) || process.env.GEMINI_API_KEY;
+    // Key Gemini do client gửi; server không lưu key nên người lạ không dùng được key của bạn
+    const key = typeof clientKey === "string" ? clientKey.trim() : "";
     if (!key || /\s/.test(key) || key.length > 200) {
-      return fail(
-        res,
-        400,
-        "Thiếu hoặc sai GEMINI key (gửi trường key, hoặc đặt GEMINI_API_KEY trên server)"
-      );
+      return fail(res, 400, "Thiếu hoặc sai GEMINI key (trường key)");
     }
 
     if (!image || typeof image !== "string") return fail(res, 400, "Thiếu image");
