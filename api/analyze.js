@@ -222,6 +222,11 @@ export default async function handler(req, res) {
       "KHÔNG đưa nút Tiếp/Đăng ký/Đồng ý vào steps (sẽ bấm sau khi kiểm tra lại). " +
       "Ô đã có đúng giá trị thì bỏ qua; mỗi ô chỉ điền một lần.\n" +
       "- type: chỉ dùng khi ô nhập đã được chọn và có thể xác định rõ ô nhập; text chỉ lấy từ DỮ LIỆU ĐƯỢC PHÉP DÙNG.\n" +
+      "- Số di động: nếu màn hình có ô nhập số di động/số điện thoại (nhãn như 'Số di động', 'Số điện thoại', 'Phone number', 'Mobile number') " +
+      "và DỮ LIỆU ĐƯỢC PHÉP DÙNG có số di động, hãy nhập số đó: nếu ô chưa được chọn thì tap vào ô trước, " +
+      "nếu ô đã được chọn (có con trỏ/bàn phím đang hiện) thì type luôn. " +
+      "Chép đúng nguyên văn số trong DỮ LIỆU ĐƯỢC PHÉP DÙNG (giữ nguyên số 0 đầu, mã vùng, ký tự nếu có), không tự đổi định dạng. " +
+      "Nếu ô đã có đúng số thì không nhập lại; nếu dữ liệu không có số di động thì trả fail, không tự bịa số.\n" +
       `- wait: dùng khi màn hình đang loading hoặc chuyển cảnh; có thể kèm "seconds" từ ${MIN_WAIT} đến ${MAX_WAIT}.\n` +
       "- done: chỉ dùng khi mục tiêu thực sự đã hoàn thành.\n" +
       "- fail: dùng khi gặp captcha, xác minh, màn hình bất thường hoặc không thể xác định hành động an toàn.\n" +
