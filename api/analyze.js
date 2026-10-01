@@ -12,7 +12,7 @@ export const config = {
 const ACTIONS = ["tap", "swipe", "type", "wait", "done", "fail"];
 
 // Model mặc định lấy từ biến môi trường, để đổi mà không cần sửa code.
-const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 // Model client được phép chọn (phân tách bằng dấu phẩy). Mặc định chỉ cho DEFAULT_MODEL.
 const ALLOWED_MODELS = (process.env.GEMINI_ALLOWED_MODELS || DEFAULT_MODEL)
   .split(",")
