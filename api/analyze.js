@@ -18,6 +18,7 @@
 // - plan
 // - type
 // - wait
+// - restart
 // - done
 // - fail
 //
@@ -26,6 +27,16 @@
 // - Password được truyền trong INFO.
 // - Gemini KHÔNG được tự tạo password.
 // - Gemini chỉ được nhập đúng password có trong INFO.
+//
+// RESTART:
+// - Nếu ảnh cho thấy trang lỗi kỹ thuật:
+//   "Trang này hiện không hiển thị"
+//   "Có thể có vấn đề kỹ thuật. Hãy làm mới để thử lại."
+//   hoặc giao diện tương đương rõ ràng
+//   => Gemini phải trả action="restart".
+//
+// - KHÔNG bấm nút "Làm mới" trên trang lỗi này.
+// - AutoTouch sẽ tự đóng app và mở lại.
 //
 // FIX:
 // - Gemini có thể trả JSON bình thường.
@@ -54,6 +65,7 @@ const ACTIONS = [
   "plan",
   "type",
   "wait",
+  "restart",
   "done",
   "fail",
 ];
@@ -184,7 +196,6 @@ function cleanJsonText(text) {
 //
 // 4. Có thể bị encode nhiều lớp.
 //
-// Hàm này xử lý tất cả các trường hợp trên.
 // ============================================================
 
 function parseGeminiAction(text) {
@@ -249,9 +260,6 @@ function parseGeminiAction(text) {
 
   // ----------------------------------------------------------
   // FALLBACK
-  //
-  // Nếu Gemini trả thêm text bên ngoài JSON,
-  // tìm object JSON đầu tiên.
   // ----------------------------------------------------------
 
   const first =
@@ -272,10 +280,6 @@ function parseGeminiAction(text) {
       );
 
 
-    // --------------------------------------------------------
-    // Parse candidate
-    // --------------------------------------------------------
-
     try {
       const parsed =
         JSON.parse(candidate);
@@ -289,10 +293,6 @@ function parseGeminiAction(text) {
     } catch {}
 
 
-    // --------------------------------------------------------
-    // Candidate là string chứa JSON
-    // --------------------------------------------------------
-
     try {
       const decoded =
         JSON.parse(candidate);
@@ -305,8 +305,7 @@ function parseGeminiAction(text) {
 
         if (
           parsedAgain &&
-          typeof parsedAgain ===
-            "object"
+          typeof parsedAgain === "object"
         ) {
           return parsedAgain;
         }
@@ -348,16 +347,6 @@ function normalizeText(s) {
 
 // ============================================================
 // INFO PARSER
-// ============================================================
-//
-// Ví dụ:
-//
-// Họ: Nguyễn
-// Tên: Văn An
-// Ngày sinh: 15/06/1995
-// Số di động: 0971234567
-// Mật khẩu: aG7kP29xLmQ4Z8
-//
 // ============================================================
 
 function getInfoValue(
@@ -484,6 +473,7 @@ function isExactPassword(
 
 function getImageInfo(buf) {
   try {
+
     // --------------------------------------------------------
     // PNG
     // --------------------------------------------------------
@@ -1065,6 +1055,7 @@ function buildPrompt({
   hist,
 }) {
   return (
+
     "Bạn là agent phân tích giao diện iPhone thông qua ảnh chụp màn hình.\n\n" +
 
 
@@ -1127,6 +1118,33 @@ function buildPrompt({
 
 
     // ========================================================
+    // RESTART
+    // ========================================================
+
+    "QUY TẮC KHỞI ĐỘNG LẠI ỨNG DỤNG:\n" +
+
+    "- Đây là QUY TẮC ƯU TIÊN CAO.\n" +
+
+    "- Nếu screenshot hiện rõ trang lỗi kỹ thuật với nội dung như 'Trang này hiện không hiển thị', 'Có thể có vấn đề kỹ thuật. Hãy làm mới để thử lại.', hoặc giao diện tương đương rõ ràng cho thấy trang hiện tại không hiển thị do lỗi kỹ thuật, phải trả action='restart'.\n" +
+
+    "- Khi phát hiện trang lỗi kỹ thuật nói trên, KHÔNG được bấm nút 'Làm mới'.\n" +
+
+    "- Không được trả action='tap' vào nút 'Làm mới' trên trang lỗi này.\n" +
+
+    "- Không được trả action='wait' nếu trang lỗi kỹ thuật đã hiển thị rõ ràng.\n" +
+
+    "- Không được trả action='done'.\n" +
+
+    "- Không được cố tiếp tục thao tác trên trang lỗi.\n" +
+
+    "- action='restart' có nghĩa là AutoTouch sẽ đóng ứng dụng hiện tại rồi mở lại ứng dụng.\n" +
+
+    "- restart không cần point, không cần text, không cần steps.\n" +
+
+    "- Chỉ dùng restart khi lỗi kỹ thuật được nhìn thấy rõ ràng; không dùng chỉ vì một màn hình bình thường chưa quen thuộc.\n\n" +
+
+
+    // ========================================================
     // GOAL
     // ========================================================
 
@@ -1181,7 +1199,7 @@ function buildPrompt({
 
     "FORMAT:\n" +
 
-    '{"action":"tap|swipe|wheel|plan|type|wait|done|fail",' +
+    '{"action":"tap|swipe|wheel|plan|type|wait|restart|done|fail",' +
     '"point":[y,x],' +
     '"to_point":[y,x],' +
     '"text":"","seconds":2,' +
@@ -1376,6 +1394,7 @@ export default async function handler(
   req,
   res
 ) {
+
   // ----------------------------------------------------------
   // METHOD
   // ----------------------------------------------------------
@@ -1392,6 +1411,7 @@ export default async function handler(
 
 
   try {
+
     // ========================================================
     // INPUT
     // ========================================================
@@ -1584,10 +1604,6 @@ export default async function handler(
       Boolean(password);
 
 
-    // --------------------------------------------------------
-    // Không log password.
-    // --------------------------------------------------------
-
     console.log(
       "[INFO] Password supplied:",
       hasPassword
@@ -1683,6 +1699,7 @@ export default async function handler(
 
 
     try {
+
       response =
         await fetchWithRetry(
           useModel,
@@ -1738,6 +1755,7 @@ export default async function handler(
         await response.text();
 
     } catch (e) {
+
       if (
         e?.name ===
         "AbortError"
@@ -1752,7 +1770,9 @@ export default async function handler(
       throw e;
 
     } finally {
+
       clearTimeout(timer);
+
     }
 
 
@@ -1783,12 +1803,14 @@ export default async function handler(
 
 
     try {
+
       data =
         JSON.parse(
           rawResponse
         );
 
     } catch {
+
       return fail(
         res,
         502,
@@ -1801,6 +1823,7 @@ export default async function handler(
             ),
         }
       );
+
     }
 
 
@@ -1844,23 +1867,12 @@ export default async function handler(
     // ========================================================
     // PARSE OUTPUT
     // ========================================================
-    //
-    // ĐÂY LÀ PHẦN ĐÃ SỬA LỖI 502.
-    //
-    // Có thể xử lý:
-    //
-    // {"action":"wait"}
-    //
-    // hoặc:
-    //
-    // "{\"action\":\"wait\"}"
-    //
-    // ========================================================
 
     let out;
 
 
     try {
+
       out =
         parseGeminiAction(
           text
@@ -1892,6 +1904,7 @@ export default async function handler(
             ),
         }
       );
+
     }
 
 
@@ -1991,6 +2004,34 @@ export default async function handler(
 
 
     // ========================================================
+    // RESTART
+    // ========================================================
+    //
+    // restart KHÔNG cần:
+    // - point
+    // - text
+    // - steps
+    // - seconds
+    //
+    // AutoTouch sẽ xử lý action này.
+    //
+    // ========================================================
+
+    if (
+      action === "restart"
+    ) {
+
+      console.log(
+        "[ACTION] restart requested by Gemini"
+      );
+
+      return res
+        .status(200)
+        .json(result);
+    }
+
+
+    // ========================================================
     // TAP / SWIPE
     // ========================================================
 
@@ -1998,6 +2039,7 @@ export default async function handler(
       action === "tap" ||
       action === "swipe"
     ) {
+
       if (
         !isPoint(
           item.point
@@ -2069,6 +2111,7 @@ export default async function handler(
     if (
       action === "swipe"
     ) {
+
       if (
         !isPoint(
           item.to_point
@@ -2140,6 +2183,7 @@ export default async function handler(
     if (
       action === "plan"
     ) {
+
       const rawSteps =
         Array.isArray(
           item.steps
@@ -2194,6 +2238,7 @@ export default async function handler(
     if (
       action === "wheel"
     ) {
+
       if (
         !isPoint(
           item.point
@@ -2328,6 +2373,7 @@ export default async function handler(
     if (
       action === "type"
     ) {
+
       if (
         typeof item.text !==
           "string" ||
@@ -2374,10 +2420,6 @@ export default async function handler(
         textValue ===
           password
       ) {
-        // Password hợp lệ.
-        //
-        // Không log password.
-        // Không đưa password vào reason.
 
         result.text =
           password;
@@ -2391,6 +2433,7 @@ export default async function handler(
         if (
           REQUIRE_TEXT_IN_INFO
         ) {
+
           const allowedValues =
             getAllowedInfoValues(
               infoText
@@ -2444,6 +2487,7 @@ export default async function handler(
     if (
       action === "wait"
     ) {
+
       const s =
         Number(
           item.seconds
