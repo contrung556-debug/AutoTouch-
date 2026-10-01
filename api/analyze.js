@@ -90,7 +90,7 @@ function getImageInfo(buf) {
           marker <= 0xcf &&
           marker !== 0xc4 &&
           marker !== 0xc8 &&
-          marker !== 0xcc;
+          marker !== 0xccc;
         if (isSOF) {
           const height = buf.readUInt16BE(i + 5);
           const width = buf.readUInt16BE(i + 7);
