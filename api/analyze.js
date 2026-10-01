@@ -58,7 +58,7 @@ export const config = {
 // ============================================================
 
 const DEFAULT_MODEL =
-  process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
 const ALLOWED_MODELS = (
   process.env.GEMINI_ALLOWED_MODELS ||
