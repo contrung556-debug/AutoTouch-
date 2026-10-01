@@ -9,7 +9,7 @@ export const config = {
 };
 
 // ====== Cấu hình ======
-const ACTIONS = ["tap", "swipe", "type", "wait", "done", "fail", "pick_date", "fill_name"];
+const ACTIONS = ["tap", "swipe", "wheel", "type", "wait", "done", "fail"];
 
 // Model mặc định lấy từ biến môi trường, để đổi mà không cần sửa code.
 const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
@@ -26,6 +26,7 @@ const MAX_INFO = 2000;
 const MAX_RULES = 20;
 const MAX_RULE_LEN = 300;
 const MAX_TYPE_LEN = 200;
+const MAX_WHEEL_ROWS = 60; // số dòng tối đa mỗi lần xoay bánh xe
 const MIN_WAIT = 1;
 const MAX_WAIT = 10;
 const GEMINI_TIMEOUT_MS = 45000;
@@ -90,7 +91,7 @@ function getImageInfo(buf) {
           marker <= 0xcf &&
           marker !== 0xc4 &&
           marker !== 0xc8 &&
-          marker !== 0xccc;
+          marker !== 0xcc;
         if (isSOF) {
           const height = buf.readUInt16BE(i + 5);
           const width = buf.readUInt16BE(i + 7);
@@ -112,7 +113,7 @@ const RETRY_DELAY_MS = 1500;
 
 function modelUrl(model) {
   return (
-    "[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)" +
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
     encodeURIComponent(model) +
     ":generateContent"
   );
@@ -203,13 +204,17 @@ export default async function handler(req, res) {
       "Hãy phân tích chính xác ảnh hiện tại.\n" +
       "Chỉ trả về MỘT JSON object hợp lệ.\n\n" +
       "FORMAT:\n" +
-      '{"action":"tap|swipe|type|wait|done|fail|pick_date|fill_name","point":[y,x],"to_point":[y,x],"text":"","seconds":2,"reason":"lý do ngắn"}' +
+      '{"action":"tap|swipe|wheel|type|wait|done|fail","point":[y,x],"to_point":[y,x],"text":"","seconds":2,"rows":0,"row_height":0,"reason":"lý do ngắn"}' +
       "\n\n" +
       "QUY TẮC:\n" +
       "- point và to_point dùng tọa độ chuẩn hóa 0-1000 theo THỨ TỰ [y,x] (y trước, x sau; y là chiều dọc, x là chiều ngang).\n" +
-      "- MÀN HÌNH NGÀY SINH: Nếu thấy màn hình chọn ngày sinh (kể cả có dòng chữ đỏ lỗi thông tin/tuổi), BẮT BUỘC dùng action 'pick_date', CẤM dùng 'tap' hay 'fail'.\n" +
       "- tap: dùng khi có một phần tử nhìn thấy rõ cần chạm.\n" +
       "- swipe: dùng khi cần cuộn; point là điểm bắt đầu, to_point là điểm kết thúc.\n" +
+      "- wheel: dùng để xoay bộ chọn dạng bánh xe (ngày/tháng/năm). point là tâm dòng đang được chọn của ĐÚNG MỘT cột; " +
+      "rows là số dòng cần dịch (dương: chọn giá trị phía dưới/sau, âm: chọn giá trị phía trên/trước); " +
+      "row_height là chiều cao một dòng theo thang 0-1000 của chiều cao ảnh.\n" +
+      "- Với bánh xe ngày sinh: so sánh giá trị đang chọn với ngày sinh trong DỮ LIỆU ĐƯỢC PHÉP DÙNG, " +
+      "chỉnh từng cột một (mỗi bước một cột), kiểm tra lại ở ảnh kế tiếp rồi mới bấm Tiếp.\n" +
       "- type: chỉ dùng khi ô nhập đã được chọn và có thể xác định rõ ô nhập; text chỉ lấy từ DỮ LIỆU ĐƯỢC PHÉP DÙNG.\n" +
       `- wait: dùng khi màn hình đang loading hoặc chuyển cảnh; có thể kèm "seconds" từ ${MIN_WAIT} đến ${MAX_WAIT}.\n` +
       "- done: chỉ dùng khi mục tiêu thực sự đã hoàn thành.\n" +
@@ -324,6 +329,29 @@ export default async function handler(req, res) {
       result.x2 = Math.min(width - 1, Math.round((item.to_point[1] / 1000) * width));
       result.y2 = Math.min(height - 1, Math.round((item.to_point[0] / 1000) * height));
       result.to_point = item.to_point;
+    }
+
+    if (action === "wheel") {
+      if (!isPoint(item.point)) {
+        return res.status(200).json({ success: false, error: "Thiếu point hợp lệ", raw: item });
+      }
+      const rows = Math.round(Number(item.rows));
+      if (!Number.isFinite(rows) || rows === 0 || Math.abs(rows) > MAX_WHEEL_ROWS) {
+        return res.status(200).json({
+          success: false,
+          error: `rows phải khác 0 và không quá ${MAX_WHEEL_ROWS}`,
+          raw: item,
+        });
+      }
+      result.x = Math.min(width - 1, Math.round((item.point[1] / 1000) * width));
+      result.y = Math.min(height - 1, Math.round((item.point[0] / 1000) * height));
+      result.point = item.point;
+      result.rows = rows;
+
+      const rh = Number(item.row_height);
+      if (Number.isFinite(rh) && rh >= 10 && rh <= 150) {
+        result.row_px = Math.round((rh / 1000) * height);
+      }
     }
 
     if (action === "type") {
