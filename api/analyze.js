@@ -9,7 +9,7 @@ export const config = {
 };
 
 // ====== Cấu hình ======
-const ACTIONS = ["tap", "swipe", "wheel", "type", "wait", "done", "fail"];
+const ACTIONS = ["tap", "swipe", "wheel", "plan", "type", "wait", "done", "fail"];
 
 // Model mặc định lấy từ biến môi trường, để đổi mà không cần sửa code.
 const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
@@ -27,6 +27,7 @@ const MAX_RULES = 20;
 const MAX_RULE_LEN = 300;
 const MAX_TYPE_LEN = 200;
 const MAX_WHEEL_ROWS = 60; // số dòng tối đa mỗi lần xoay bánh xe
+const MAX_PLAN_STEPS = 8; // số bước tối đa trong một plan
 const MIN_WAIT = 1;
 const MAX_WAIT = 10;
 const GEMINI_TIMEOUT_MS = 45000;
@@ -204,7 +205,7 @@ export default async function handler(req, res) {
       "Hãy phân tích chính xác ảnh hiện tại.\n" +
       "Chỉ trả về MỘT JSON object hợp lệ.\n\n" +
       "FORMAT:\n" +
-      '{"action":"tap|swipe|wheel|type|wait|done|fail","point":[y,x],"to_point":[y,x],"text":"","seconds":2,"rows":0,"row_height":0,"reason":"lý do ngắn"}' +
+      '{"action":"tap|swipe|wheel|plan|type|wait|done|fail","point":[y,x],"to_point":[y,x],"text":"","seconds":2,"rows":0,"row_height":0,"steps":[{"action":"tap|type","point":[y,x],"text":""}],"reason":"lý do ngắn"}' +
       "\n\n" +
       "QUY TẮC:\n" +
       "- point và to_point dùng tọa độ chuẩn hóa 0-1000 theo THỨ TỰ [y,x] (y trước, x sau; y là chiều dọc, x là chiều ngang).\n" +
@@ -215,6 +216,11 @@ export default async function handler(req, res) {
       "row_height là chiều cao một dòng theo thang 0-1000 của chiều cao ảnh.\n" +
       "- Với bánh xe ngày sinh: so sánh giá trị đang chọn với ngày sinh trong DỮ LIỆU ĐƯỢC PHÉP DÙNG, " +
       "chỉnh từng cột một (mỗi bước một cột), kiểm tra lại ở ảnh kế tiếp rồi mới bấm Tiếp.\n" +
+      "- plan: dùng khi màn hình có NHIỀU ô nhập hiện cùng lúc (vd Họ và Tên). Trả về steps là chuỗi hành động " +
+      "theo đúng thứ tự: tap vào ô rồi type nội dung của ô đó, lặp lại cho từng ô. Trong steps chỉ dùng tap và type, " +
+      `tối đa ${MAX_PLAN_STEPS} bước, mỗi type phải đứng ngay sau tap vào đúng ô đó. ` +
+      "KHÔNG đưa nút Tiếp/Đăng ký/Đồng ý vào steps (sẽ bấm sau khi kiểm tra lại). " +
+      "Ô đã có đúng giá trị thì bỏ qua; mỗi ô chỉ điền một lần.\n" +
       "- type: chỉ dùng khi ô nhập đã được chọn và có thể xác định rõ ô nhập; text chỉ lấy từ DỮ LIỆU ĐƯỢC PHÉP DÙNG.\n" +
       `- wait: dùng khi màn hình đang loading hoặc chuyển cảnh; có thể kèm "seconds" từ ${MIN_WAIT} đến ${MAX_WAIT}.\n` +
       "- done: chỉ dùng khi mục tiêu thực sự đã hoàn thành.\n" +
@@ -329,6 +335,54 @@ export default async function handler(req, res) {
       result.x2 = Math.min(width - 1, Math.round((item.to_point[1] / 1000) * width));
       result.y2 = Math.min(height - 1, Math.round((item.to_point[0] / 1000) * height));
       result.to_point = item.to_point;
+    }
+
+    if (action === "plan") {
+      const rawSteps = Array.isArray(item.steps) ? item.steps : [];
+      if (rawSteps.length < 1 || rawSteps.length > MAX_PLAN_STEPS) {
+        return res.status(200).json({
+          success: false,
+          error: `steps phải có từ 1 đến ${MAX_PLAN_STEPS} bước`,
+          raw: item,
+        });
+      }
+
+      const steps = [];
+      let prev = "";
+      for (const st of rawSteps) {
+        const a = String(st?.action || "").toLowerCase();
+
+        if (a === "tap") {
+          if (!isPoint(st.point)) {
+            return res.status(200).json({ success: false, error: "Bước tap thiếu point hợp lệ", raw: item });
+          }
+          steps.push({
+            action: "tap",
+            x: Math.min(width - 1, Math.round((st.point[1] / 1000) * width)),
+            y: Math.min(height - 1, Math.round((st.point[0] / 1000) * height)),
+          });
+        } else if (a === "type") {
+          // type chỉ hợp lệ khi vừa tap vào một ô ngay trước đó
+          if (prev !== "tap") {
+            return res.status(200).json({ success: false, error: "Bước type phải đứng ngay sau tap", raw: item });
+          }
+          if (typeof st.text !== "string" || !st.text.length || st.text.length > MAX_TYPE_LEN) {
+            return res.status(200).json({ success: false, error: "Text trong plan không hợp lệ", raw: item });
+          }
+          if (REQUIRE_TEXT_IN_INFO && !infoText.includes(st.text)) {
+            return res.status(200).json({
+              success: false,
+              error: "Text trong plan không nằm trong dữ liệu được phép dùng (info)",
+            });
+          }
+          steps.push({ action: "type", text: st.text });
+        } else {
+          return res.status(200).json({ success: false, error: "Plan chỉ cho phép tap và type", raw: item });
+        }
+        prev = a;
+      }
+
+      result.steps = steps;
     }
 
     if (action === "wheel") {
