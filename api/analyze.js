@@ -12,7 +12,7 @@ export const config = {
 const ACTIONS = ["tap", "swipe", "type", "wait", "done", "fail"];
 
 // Model mặc định lấy từ biến môi trường, để đổi mà không cần sửa code.
-const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 // Model client được phép chọn (phân tách bằng dấu phẩy). Mặc định chỉ cho DEFAULT_MODEL.
 const ALLOWED_MODELS = (process.env.GEMINI_ALLOWED_MODELS || DEFAULT_MODEL)
   .split(",")
@@ -28,7 +28,7 @@ const MAX_RULE_LEN = 300;
 const MAX_TYPE_LEN = 200;
 const MIN_WAIT = 1;
 const MAX_WAIT = 10;
-const GEMINI_TIMEOUT_MS = 30000;
+const GEMINI_TIMEOUT_MS = 45000;
 
 // Chỉ cho phép gõ text nằm trong `info`. Đặt REQUIRE_TEXT_IN_INFO=0 để tắt.
 const REQUIRE_TEXT_IN_INFO = process.env.REQUIRE_TEXT_IN_INFO !== "0";
@@ -103,6 +103,31 @@ function getImageInfo(buf) {
     return null;
   } catch {
     return null;
+  }
+}
+
+const RETRY_STATUS = new Set([429, 500, 502, 503, 504]);
+const FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-3.8-flash";
+const RETRY_DELAY_MS = 1500;
+
+function modelUrl(model) {
+  return (
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(model) +
+    ":generateContent"
+  );
+}
+
+// Thử model chính 2 lần, rồi model dự phòng 1 lần khi Gemini quá tải (503/429/5xx)
+async function fetchWithRetry(model, options) {
+  const models = [model, model];
+  if (FALLBACK_MODEL && FALLBACK_MODEL !== model) models.push(FALLBACK_MODEL);
+
+  for (let i = 0; i < models.length; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+    const res = await fetch(modelUrl(models[i]), options);
+    if (!RETRY_STATUS.has(res.status) || i === models.length - 1) return res;
+    await res.text().catch(() => {}); // bỏ nội dung lỗi rồi thử lại
   }
 }
 
@@ -199,17 +224,12 @@ export default async function handler(req, res) {
       "- Nếu không chắc chắn, trả fail thay vì đoán.\n";
 
     // --- Gọi Gemini (có timeout) ---
-    const url =
-      "https://generativelanguage.googleapis.com/v1beta/models/" +
-      encodeURIComponent(useModel) +
-      ":generateContent";
-
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
 
     let response, rawResponse;
     try {
-      response = await fetch(url, {
+      response = await fetchWithRetry(useModel, {
         method: "POST",
         signal: controller.signal,
         headers: {
