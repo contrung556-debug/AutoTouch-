@@ -9,7 +9,7 @@ export const config = {
 };
 
 // ====== Cấu hình ======
-const ACTIONS = ["tap", "swipe", "type", "wait", "done", "fail", "pick_date"];
+const ACTIONS = ["tap", "swipe", "type", "wait", "done", "fail", "pick_date", "fill_name"];
 
 // Model mặc định lấy từ biến môi trường, để đổi mà không cần sửa code.
 const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
@@ -90,7 +90,7 @@ function getImageInfo(buf) {
           marker <= 0xcf &&
           marker !== 0xc4 &&
           marker !== 0xc8 &&
-          marker !== 0xcc;
+          marker !== 0xccc;
         if (isSOF) {
           const height = buf.readUInt16BE(i + 5);
           const width = buf.readUInt16BE(i + 7);
@@ -203,7 +203,7 @@ export default async function handler(req, res) {
       "Hãy phân tích chính xác ảnh hiện tại.\n" +
       "Chỉ trả về MỘT JSON object hợp lệ.\n\n" +
       "FORMAT:\n" +
-      '{"action":"tap|swipe|type|wait|done|fail|pick_date","point":[y,x],"to_point":[y,x],"text":"","seconds":2,"reason":"lý do ngắn"}' +
+      '{"action":"tap|swipe|type|wait|done|fail|pick_date|fill_name","point":[y,x],"to_point":[y,x],"text":"","seconds":2,"reason":"lý do ngắn"}' +
       "\n\n" +
       "QUY TẮC:\n" +
       "- point và to_point dùng tọa độ chuẩn hóa 0-1000 theo THỨ TỰ [y,x] (y trước, x sau; y là chiều dọc, x là chiều ngang).\n" +
@@ -350,6 +350,11 @@ export default async function handler(req, res) {
       result.seconds = Number.isFinite(s)
         ? Math.min(MAX_WAIT, Math.max(MIN_WAIT, s))
         : 2;
+    }
+
+    // Trả về trực tiếp cho các custom action không cần điểm/tọa độ đặc biệt
+    if (action === "pick_date" || action === "fill_name" || action === "done" || action === "fail") {
+      return res.status(200).json(result);
     }
 
     return res.status(200).json(result);
