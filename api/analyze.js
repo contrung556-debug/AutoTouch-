@@ -9,7 +9,7 @@ export const config = {
 };
 
 // ====== Cấu hình ======
-const ACTIONS = ["tap", "swipe", "type", "wait", "done", "fail"];
+const ACTIONS = ["tap", "swipe", "type", "wait", "done", "fail", "pick_date"];
 
 // Model mặc định lấy từ biến môi trường, để đổi mà không cần sửa code.
 const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
@@ -112,7 +112,7 @@ const RETRY_DELAY_MS = 1500;
 
 function modelUrl(model) {
   return (
-    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    "[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/)" +
     encodeURIComponent(model) +
     ":generateContent"
   );
@@ -203,10 +203,11 @@ export default async function handler(req, res) {
       "Hãy phân tích chính xác ảnh hiện tại.\n" +
       "Chỉ trả về MỘT JSON object hợp lệ.\n\n" +
       "FORMAT:\n" +
-      '{"action":"tap|swipe|type|wait|done|fail","point":[y,x],"to_point":[y,x],"text":"","seconds":2,"reason":"lý do ngắn"}' +
+      '{"action":"tap|swipe|type|wait|done|fail|pick_date","point":[y,x],"to_point":[y,x],"text":"","seconds":2,"reason":"lý do ngắn"}' +
       "\n\n" +
       "QUY TẮC:\n" +
       "- point và to_point dùng tọa độ chuẩn hóa 0-1000 theo THỨ TỰ [y,x] (y trước, x sau; y là chiều dọc, x là chiều ngang).\n" +
+      "- QUY TẮC MÀN HÌNH NGÀY SINH: Nếu phát hiện màn hình chọn ngày sinh (có dòng chữ 'Ngày sinh của bạn là khi nào?', các ô cuộn Ngày/Tháng/Năm, hoặc cả khi hiển thị lỗi đỏ sai tuổi), BẮT BUỘC trả về action 'pick_date'. CẤM tuyệt đối dùng 'tap', 'type' hoặc 'fail' trên màn hình này.\n" +
       "- tap: dùng khi có một phần tử nhìn thấy rõ cần chạm.\n" +
       "- swipe: dùng khi cần cuộn; point là điểm bắt đầu, to_point là điểm kết thúc.\n" +
       "- type: chỉ dùng khi ô nhập đã được chọn và có thể xác định rõ ô nhập; text chỉ lấy từ DỮ LIỆU ĐƯỢC PHÉP DÙNG.\n" +
