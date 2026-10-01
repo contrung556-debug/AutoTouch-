@@ -26,7 +26,12 @@
 // - Password được truyền trong INFO.
 // - Gemini KHÔNG được tự tạo password.
 // - Gemini chỉ được nhập đúng password có trong INFO.
-// - Server kiểm tra text password phải khớp chính xác.
+//
+// FIX:
+// - Gemini có thể trả JSON bình thường.
+// - Gemini có thể trả JSON bị encode thành STRING.
+// - Gemini có thể trả JSON trong ```json ... ```.
+// - Server xử lý được cả các trường hợp trên.
 // ============================================================
 
 export const config = {
@@ -59,7 +64,8 @@ const ACTIONS = [
 // ============================================================
 
 const DEFAULT_MODEL =
-  process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+  process.env.GEMINI_MODEL ||
+  "gemini-3.5-flash-lite";
 
 const ALLOWED_MODELS = (
   process.env.GEMINI_ALLOWED_MODELS ||
@@ -117,8 +123,6 @@ const RETRY_DELAY_MS = 1500;
 //
 // type chỉ được phép sử dụng text xuất hiện trong INFO.
 //
-// Password có thêm kiểm tra chính xác riêng.
-//
 // ============================================================
 
 const REQUIRE_TEXT_IN_INFO =
@@ -144,8 +148,13 @@ function isPoint(p) {
 }
 
 
+// ============================================================
+// CLEAN GEMINI TEXT
+// ============================================================
+
 function cleanJsonText(text) {
   return String(text || "")
+    .replace(/^\uFEFF/, "")
     .replace(/^```json\s*/i, "")
     .replace(/^```\s*/i, "")
     .replace(/\s*```$/i, "")
@@ -153,14 +162,182 @@ function cleanJsonText(text) {
 }
 
 
+// ============================================================
+// PARSE GEMINI ACTION
+// ============================================================
+//
+// Gemini có thể trả:
+//
+// 1. Object:
+//
+// {"action":"wait",...}
+//
+// 2. String chứa JSON:
+//
+// "{\"action\":\"wait\",...}"
+//
+// 3. Markdown:
+//
+// ```json
+// {"action":"wait",...}
+// ```
+//
+// 4. Có thể bị encode nhiều lớp.
+//
+// Hàm này xử lý tất cả các trường hợp trên.
+// ============================================================
+
+function parseGeminiAction(text) {
+  let current =
+    cleanJsonText(text);
+
+  if (!current) {
+    throw new Error(
+      "Gemini trả nội dung rỗng"
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Parse tối đa 3 lớp
+  // ----------------------------------------------------------
+
+  for (
+    let i = 0;
+    i < 3;
+    i++
+  ) {
+    let parsed = null;
+
+    try {
+      parsed =
+        JSON.parse(current);
+    } catch {
+      parsed = null;
+    }
+
+
+    // --------------------------------------------------------
+    // Đã là object / array
+    // --------------------------------------------------------
+
+    if (
+      parsed &&
+      typeof parsed === "object"
+    ) {
+      return parsed;
+    }
+
+
+    // --------------------------------------------------------
+    // JSON string chứa JSON
+    // --------------------------------------------------------
+
+    if (
+      typeof parsed === "string"
+    ) {
+      current =
+        cleanJsonText(parsed);
+
+      continue;
+    }
+
+
+    break;
+  }
+
+
+  // ----------------------------------------------------------
+  // FALLBACK
+  //
+  // Nếu Gemini trả thêm text bên ngoài JSON,
+  // tìm object JSON đầu tiên.
+  // ----------------------------------------------------------
+
+  const first =
+    current.indexOf("{");
+
+  const last =
+    current.lastIndexOf("}");
+
+
+  if (
+    first >= 0 &&
+    last > first
+  ) {
+    const candidate =
+      current.slice(
+        first,
+        last + 1
+      );
+
+
+    // --------------------------------------------------------
+    // Parse candidate
+    // --------------------------------------------------------
+
+    try {
+      const parsed =
+        JSON.parse(candidate);
+
+      if (
+        parsed &&
+        typeof parsed === "object"
+      ) {
+        return parsed;
+      }
+    } catch {}
+
+
+    // --------------------------------------------------------
+    // Candidate là string chứa JSON
+    // --------------------------------------------------------
+
+    try {
+      const decoded =
+        JSON.parse(candidate);
+
+      if (
+        typeof decoded === "string"
+      ) {
+        const parsedAgain =
+          JSON.parse(decoded);
+
+        if (
+          parsedAgain &&
+          typeof parsedAgain ===
+            "object"
+        ) {
+          return parsedAgain;
+        }
+      }
+    } catch {}
+  }
+
+
+  throw new Error(
+    "Không parse được JSON action từ Gemini"
+  );
+}
+
+
+// ============================================================
+// CLIP
+// ============================================================
+
 function clip(s, max) {
-  const str = String(s ?? "");
+  const str =
+    String(s ?? "");
 
   return str.length > max
     ? str.slice(0, max) + "…"
     : str;
 }
 
+
+// ============================================================
+// NORMALIZE TEXT
+// ============================================================
 
 function normalizeText(s) {
   return String(s ?? "")
@@ -175,8 +352,6 @@ function normalizeText(s) {
 //
 // Ví dụ:
 //
-// INFO:
-//
 // Họ: Nguyễn
 // Tên: Văn An
 // Ngày sinh: 15/06/1995
@@ -185,26 +360,38 @@ function normalizeText(s) {
 //
 // ============================================================
 
-function getInfoValue(infoText, label) {
-  const info = String(infoText || "");
+function getInfoValue(
+  infoText,
+  label
+) {
+  const info =
+    String(infoText || "");
 
-  const lines = info.split(/\r?\n/);
+  const lines =
+    info.split(/\r?\n/);
 
-  const wanted = normalizeText(label)
-    .toLowerCase();
+  const wanted =
+    normalizeText(label)
+      .toLowerCase();
 
-  for (const line of lines) {
-    const idx = line.indexOf(":");
+  for (
+    const line of lines
+  ) {
+    const idx =
+      line.indexOf(":");
 
     if (idx < 0) {
       continue;
     }
 
-    const key = normalizeText(
-      line.slice(0, idx)
-    ).toLowerCase();
+    const key =
+      normalizeText(
+        line.slice(0, idx)
+      ).toLowerCase();
 
-    if (key !== wanted) {
+    if (
+      key !== wanted
+    ) {
       continue;
     }
 
@@ -217,23 +404,35 @@ function getInfoValue(infoText, label) {
 }
 
 
-function getAllowedInfoValues(infoText) {
+// ============================================================
+// GET ALLOWED INFO VALUES
+// ============================================================
+
+function getAllowedInfoValues(
+  infoText
+) {
   const values = [];
 
-  const info = String(infoText || "");
+  const info =
+    String(infoText || "");
 
-  const lines = info.split(/\r?\n/);
+  const lines =
+    info.split(/\r?\n/);
 
-  for (const line of lines) {
-    const idx = line.indexOf(":");
+  for (
+    const line of lines
+  ) {
+    const idx =
+      line.indexOf(":");
 
     if (idx < 0) {
       continue;
     }
 
-    const value = normalizeText(
-      line.slice(idx + 1)
-    );
+    const value =
+      normalizeText(
+        line.slice(idx + 1)
+      );
 
     if (value) {
       values.push(value);
@@ -248,7 +447,9 @@ function getAllowedInfoValues(infoText) {
 // PASSWORD
 // ============================================================
 
-function getPasswordFromInfo(infoText) {
+function getPasswordFromInfo(
+  infoText
+) {
   return getInfoValue(
     infoText,
     "Mật khẩu"
@@ -256,9 +457,14 @@ function getPasswordFromInfo(infoText) {
 }
 
 
-function isExactPassword(text, infoText) {
+function isExactPassword(
+  text,
+  infoText
+) {
   const password =
-    getPasswordFromInfo(infoText);
+    getPasswordFromInfo(
+      infoText
+    );
 
   if (!password) {
     return false;
@@ -284,7 +490,8 @@ function getImageInfo(buf) {
 
     if (
       buf.length >= 24 &&
-      buf.readUInt32BE(0) === 0x89504e47
+      buf.readUInt32BE(0) ===
+        0x89504e47
     ) {
       const width =
         buf.readUInt32BE(16);
@@ -292,7 +499,10 @@ function getImageInfo(buf) {
       const height =
         buf.readUInt32BE(20);
 
-      if (width && height) {
+      if (
+        width &&
+        height
+      ) {
         return {
           mime: "image/png",
           width,
@@ -363,7 +573,7 @@ function getImageInfo(buf) {
         if (
           !len ||
           i + 2 + len >
-          buf.length
+            buf.length
         ) {
           return null;
         }
@@ -454,6 +664,7 @@ async function fetchWithRetry(
     );
   }
 
+
   for (
     let i = 0;
     i < models.length;
@@ -469,25 +680,30 @@ async function fetchWithRetry(
       );
     }
 
+
     const res =
       await fetch(
         modelUrl(models[i]),
         options
       );
 
+
     if (
       !RETRY_STATUS.has(
         res.status
       ) ||
-      i === models.length - 1
+      i ===
+        models.length - 1
     ) {
       return res;
     }
+
 
     await res
       .text()
       .catch(() => {});
   }
+
 
   throw new Error(
     "Gemini retry thất bại"
@@ -537,6 +753,7 @@ function validateAndBuildPlan(
     };
   }
 
+
   if (
     rawSteps.length < 1 ||
     rawSteps.length >
@@ -549,7 +766,9 @@ function validateAndBuildPlan(
     };
   }
 
+
   const steps = [];
+
 
   for (
     let i = 0;
@@ -558,6 +777,7 @@ function validateAndBuildPlan(
   ) {
     const st =
       rawSteps[i];
+
 
     if (
       !st ||
@@ -569,6 +789,7 @@ function validateAndBuildPlan(
           "Bước plan không hợp lệ",
       };
     }
+
 
     const action =
       String(
@@ -595,6 +816,7 @@ function validateAndBuildPlan(
         };
       }
 
+
       if (i > 0) {
         const previousAction =
           String(
@@ -615,6 +837,7 @@ function validateAndBuildPlan(
         }
       }
 
+
       const x =
         Math.min(
           width - 1,
@@ -625,10 +848,11 @@ function validateAndBuildPlan(
                 st.point[1] /
                 1000
               ) *
-              width
+                width
             )
           )
         );
+
 
       const y =
         Math.min(
@@ -640,16 +864,18 @@ function validateAndBuildPlan(
                 st.point[0] /
                 1000
               ) *
-              height
+                height
             )
           )
         );
+
 
       steps.push({
         action: "tap",
         x,
         y,
       });
+
 
       continue;
     }
@@ -674,6 +900,7 @@ function validateAndBuildPlan(
         };
       }
 
+
       if (
         st.text.length >
         MAX_TYPE_LEN
@@ -697,6 +924,7 @@ function validateAndBuildPlan(
               i - 1
             ]?.action || ""
           ).toLowerCase();
+
 
         if (
           previousAction !==
@@ -723,27 +951,32 @@ function validateAndBuildPlan(
             st.text
           );
 
+
         const password =
           getPasswordFromInfo(
             infoText
           );
 
-        // Password được phép nếu
-        // khớp chính xác password trong INFO.
+
         const isPassword =
-          password &&
-          text === password;
+          Boolean(
+            password &&
+            text === password
+          );
+
 
         const allowedValues =
           getAllowedInfoValues(
             infoText
           );
 
+
         const normalAllowed =
           allowedValues.some(
             (value) =>
               value === text
           );
+
 
         if (
           !normalAllowed &&
@@ -762,6 +995,7 @@ function validateAndBuildPlan(
         action: "type",
         text: st.text,
       });
+
 
       continue;
     }
@@ -797,6 +1031,7 @@ function validateAndBuildPlan(
       };
     }
 
+
     if (
       steps[i - 1].action ===
         "type" &&
@@ -831,6 +1066,7 @@ function buildPrompt({
 }) {
   return (
     "Bạn là agent phân tích giao diện iPhone thông qua ảnh chụp màn hình.\n\n" +
+
 
     // ========================================================
     // SECURITY
@@ -935,7 +1171,13 @@ function buildPrompt({
 
     "Hãy phân tích chính xác ảnh hiện tại.\n" +
 
-    "Chỉ trả về MỘT JSON object hợp lệ.\n\n" +
+    "Chỉ trả về MỘT JSON object hợp lệ.\n" +
+
+    "KHÔNG trả markdown.\n" +
+
+    "KHÔNG trả ```json.\n" +
+
+    "KHÔNG trả JSON dưới dạng chuỗi.\n\n" +
 
     "FORMAT:\n" +
 
@@ -975,7 +1217,7 @@ function buildPrompt({
 
     "- Sau mỗi wheel phải kiểm tra screenshot mới.\n" +
 
-    "- Không chỉnh cột tiếp theo khi cột hiện tại chưa xác nhận đúng.\n" +
+    "- Không chỉnh cột tiếp theo khi cột hiện tại chưa xác nhận đúng.\n\n" +
 
 
     // ========================================================
@@ -983,8 +1225,6 @@ function buildPrompt({
     // ========================================================
 
     "- plan: dùng khi màn hình có NHIỀU ô nhập hiện cùng lúc, ví dụ Họ và Tên.\n" +
-
-    "- Trong plan chỉ được dùng tap và type.\n" +
 
     `- plan tối đa ${MAX_PLAN_STEPS} bước.\n` +
 
@@ -1010,7 +1250,7 @@ function buildPrompt({
 
     "- Sau plan phải kiểm tra screenshot kế tiếp.\n" +
 
-    "- Password có thể xuất hiện trong plan nếu và chỉ nếu text đúng bằng trường 'Mật khẩu' trong INFO.\n" +
+    "- Password có thể xuất hiện trong plan nếu và chỉ nếu text đúng bằng trường 'Mật khẩu' trong INFO.\n\n" +
 
 
     // ========================================================
@@ -1025,7 +1265,7 @@ function buildPrompt({
 
     "- Không được type password do AI tự nghĩ ra.\n" +
 
-    "- Nếu input đã có giá trị đúng thì không type lại.\n" +
+    "- Nếu input đã có giá trị đúng thì không type lại.\n\n" +
 
 
     // ========================================================
@@ -1040,7 +1280,7 @@ function buildPrompt({
 
     "- Nếu app đã chọn +84 thì tuân theo định dạng INFO.\n" +
 
-    "- Nếu không có số điện thoại trong INFO thì không tự bịa số.\n" +
+    "- Nếu không có số điện thoại trong INFO thì không tự bịa số.\n\n" +
 
 
     // ========================================================
@@ -1055,7 +1295,7 @@ function buildPrompt({
 
     "- Sau mỗi wheel phải kiểm tra screenshot mới.\n" +
 
-    "- Chỉ bấm Tiếp khi ngày/tháng/năm đều đúng.\n" +
+    "- Chỉ bấm Tiếp khi ngày/tháng/năm đều đúng.\n\n" +
 
 
     // ========================================================
@@ -1072,7 +1312,7 @@ function buildPrompt({
 
     "- Không suy đoán button loading là button có thể bấm.\n" +
 
-    "- Nếu màn hình đang loading rõ ràng, ưu tiên wait.\n" +
+    "- Nếu màn hình đang loading rõ ràng, ưu tiên wait.\n\n" +
 
 
     // ========================================================
@@ -1081,7 +1321,7 @@ function buildPrompt({
 
     "- Không chạm nút bị disabled.\n" +
 
-    "- Nếu nút Tiếp disabled thì kiểm tra còn thiếu dữ liệu nào.\n" +
+    "- Nếu nút Tiếp disabled thì kiểm tra còn thiếu dữ liệu nào.\n\n" +
 
 
     // ========================================================
@@ -1090,7 +1330,7 @@ function buildPrompt({
 
     "- Nếu checkbox/toggle/lựa chọn đã đúng thì không chạm lại.\n" +
 
-    "- Nếu đã chọn đúng giới tính thì không chọn lại.\n" +
+    "- Nếu đã chọn đúng giới tính thì không chọn lại.\n\n" +
 
 
     // ========================================================
@@ -1101,7 +1341,7 @@ function buildPrompt({
 
     "- Không bấm banner quảng cáo.\n" +
 
-    "- Không bấm liên kết có dấu hiệu mở website hoặc ứng dụng bên ngoài nếu không cần cho GOAL.\n" +
+    "- Không bấm liên kết có dấu hiệu mở website hoặc ứng dụng bên ngoài nếu không cần cho GOAL.\n\n" +
 
 
     // ========================================================
@@ -1114,7 +1354,7 @@ function buildPrompt({
 
     "- Không đoán tọa độ.\n" +
 
-    "- Chỉ sử dụng phần tử thực sự nhìn thấy trong ảnh.\n" +
+    "- Chỉ sử dụng phần tử thực sự nhìn thấy trong ảnh.\n\n" +
 
 
     // ========================================================
@@ -1177,6 +1417,7 @@ export default async function handler(
         ? clientKey.trim()
         : "";
 
+
     if (
       !key ||
       /\s/.test(key) ||
@@ -1232,6 +1473,7 @@ export default async function handler(
       model ||
       DEFAULT_MODEL;
 
+
     if (
       !ALLOWED_MODELS.includes(
         useModel
@@ -1261,6 +1503,7 @@ export default async function handler(
         )
         .trim();
 
+
     if (!base64) {
       return fail(
         res,
@@ -1275,6 +1518,7 @@ export default async function handler(
         base64,
         "base64"
       );
+
 
     if (!buf.length) {
       return fail(
@@ -1291,6 +1535,7 @@ export default async function handler(
 
     const imgInfo =
       getImageInfo(buf);
+
 
     if (!imgInfo) {
       return fail(
@@ -1317,6 +1562,7 @@ export default async function handler(
         MAX_GOAL
       );
 
+
     const infoText =
       clip(
         info || "",
@@ -1332,6 +1578,7 @@ export default async function handler(
       getPasswordFromInfo(
         infoText
       );
+
 
     const hasPassword =
       Boolean(password);
@@ -1360,6 +1607,7 @@ export default async function handler(
           )
         : [];
 
+
     const hist =
       histArr.length
         ? histArr
@@ -1385,6 +1633,7 @@ export default async function handler(
             MAX_RULES
           )
         : [];
+
 
     const userRules =
       rulesArr.length
@@ -1420,6 +1669,7 @@ export default async function handler(
     const controller =
       new AbortController();
 
+
     const timer =
       setTimeout(
         () =>
@@ -1427,8 +1677,10 @@ export default async function handler(
         GEMINI_TIMEOUT_MS
       );
 
+
     let response;
     let rawResponse;
+
 
     try {
       response =
@@ -1481,6 +1733,7 @@ export default async function handler(
           }
         );
 
+
       rawResponse =
         await response.text();
 
@@ -1523,24 +1776,29 @@ export default async function handler(
 
 
     // ========================================================
-    // PARSE GEMINI RESPONSE
+    // PARSE GEMINI HTTP RESPONSE
     // ========================================================
 
     let data;
+
 
     try {
       data =
         JSON.parse(
           rawResponse
         );
+
     } catch {
       return fail(
         res,
         502,
-        "Gemini trả response không phải JSON",
+        "Gemini trả response HTTP không phải JSON",
         {
           detail:
-            rawResponse,
+            clip(
+              rawResponse,
+              3000
+            ),
         }
       );
     }
@@ -1554,6 +1812,7 @@ export default async function handler(
       data?.candidates?.[0]
         ?.content?.parts ||
       [];
+
 
     const text =
       parts
@@ -1585,21 +1844,52 @@ export default async function handler(
     // ========================================================
     // PARSE OUTPUT
     // ========================================================
+    //
+    // ĐÂY LÀ PHẦN ĐÃ SỬA LỖI 502.
+    //
+    // Có thể xử lý:
+    //
+    // {"action":"wait"}
+    //
+    // hoặc:
+    //
+    // "{\"action\":\"wait\"}"
+    //
+    // ========================================================
 
     let out;
 
+
     try {
       out =
-        JSON.parse(
-          cleanJsonText(text)
+        parseGeminiAction(
+          text
         );
-    } catch {
+
+    } catch (e) {
+
+      console.error(
+        "[GEMINI ACTION PARSE ERROR]",
+        e?.message || e
+      );
+
+
+      console.error(
+        "[GEMINI ACTION RAW]",
+        text
+      );
+
+
       return fail(
         res,
         502,
         "Không parse được JSON từ Gemini",
         {
-          raw: text,
+          raw:
+            clip(
+              text,
+              2000
+            ),
         }
       );
     }
@@ -1614,6 +1904,31 @@ export default async function handler(
         ? out[0] || {}
         : out;
 
+
+    if (
+      !item ||
+      typeof item !==
+        "object" ||
+      Array.isArray(item)
+    ) {
+      return fail(
+        res,
+        502,
+        "Gemini trả action không phải object",
+        {
+          raw:
+            clip(
+              text,
+              2000
+            ),
+        }
+      );
+    }
+
+
+    // ========================================================
+    // ACTION
+    // ========================================================
 
     const action =
       String(
@@ -1640,11 +1955,13 @@ export default async function handler(
 
           raw: {
             action,
-            reason: clip(
-              item?.reason ||
-                "",
-              300
-            ),
+
+            reason:
+              clip(
+                item?.reason ||
+                  "",
+                300
+              ),
           },
         });
     }
@@ -1659,10 +1976,11 @@ export default async function handler(
 
       action,
 
-      reason: clip(
-        item.reason || "",
-        300
-      ),
+      reason:
+        clip(
+          item.reason || "",
+          300
+        ),
 
       image_width:
         width,
@@ -1695,6 +2013,7 @@ export default async function handler(
 
             raw: {
               action,
+
               reason:
                 clip(
                   item.reason ||
@@ -1716,7 +2035,7 @@ export default async function handler(
                 item.point[1] /
                 1000
               ) *
-              width
+                width
             )
           )
         );
@@ -1732,7 +2051,7 @@ export default async function handler(
                 item.point[0] /
                 1000
               ) *
-              height
+                height
             )
           )
         );
@@ -1765,6 +2084,7 @@ export default async function handler(
 
             raw: {
               action,
+
               reason:
                 clip(
                   item.reason ||
@@ -1786,7 +2106,7 @@ export default async function handler(
                 item.to_point[1] /
                 1000
               ) *
-              width
+                width
             )
           )
         );
@@ -1802,7 +2122,7 @@ export default async function handler(
                 item.to_point[0] /
                 1000
               ) *
-              height
+                height
             )
           )
         );
@@ -1850,6 +2170,7 @@ export default async function handler(
 
             raw: {
               action,
+
               reason:
                 clip(
                   item.reason ||
@@ -1888,6 +2209,7 @@ export default async function handler(
 
             raw: {
               action,
+
               reason:
                 clip(
                   item.reason ||
@@ -1925,6 +2247,7 @@ export default async function handler(
 
             raw: {
               action,
+
               reason:
                 clip(
                   item.reason ||
@@ -1946,7 +2269,7 @@ export default async function handler(
                 item.point[1] /
                 1000
               ) *
-              width
+                width
             )
           )
         );
@@ -1962,7 +2285,7 @@ export default async function handler(
                 item.point[0] /
                 1000
               ) *
-              height
+                height
             )
           )
         );
@@ -1970,6 +2293,7 @@ export default async function handler(
 
       result.point =
         item.point;
+
 
       result.rows =
         rows;
@@ -1982,14 +2306,16 @@ export default async function handler(
 
 
       if (
-        Number.isFinite(rh) &&
+        Number.isFinite(
+          rh
+        ) &&
         rh >= 10 &&
         rh <= 150
       ) {
         result.row_px =
           Math.round(
             (rh / 1000) *
-            height
+              height
           );
       }
     }
@@ -2033,7 +2359,7 @@ export default async function handler(
       }
 
 
-      const text =
+      const textValue =
         normalizeText(
           item.text
         );
@@ -2045,17 +2371,19 @@ export default async function handler(
 
       if (
         password &&
-        text === password
+        textValue ===
+          password
       ) {
         // Password hợp lệ.
         //
-        // Không trả password trong reason.
         // Không log password.
-        //
+        // Không đưa password vào reason.
+
         result.text =
           password;
 
       } else {
+
         // ------------------------------------------------------
         // NORMAL INFO VALUE
         // ------------------------------------------------------
@@ -2068,11 +2396,14 @@ export default async function handler(
               infoText
             );
 
+
           const exactMatch =
             allowedValues.some(
               (value) =>
-                value === text
+                value ===
+                textValue
             );
+
 
           if (
             !exactMatch
@@ -2087,6 +2418,7 @@ export default async function handler(
 
                 raw: {
                   action,
+
                   reason:
                     clip(
                       item.reason ||
@@ -2097,6 +2429,7 @@ export default async function handler(
               });
           }
         }
+
 
         result.text =
           item.text;
@@ -2139,6 +2472,13 @@ export default async function handler(
       .json(result);
 
   } catch (e) {
+
+    console.error(
+      "[ANALYZE ERROR]",
+      e
+    );
+
+
     return fail(
       res,
       500,
