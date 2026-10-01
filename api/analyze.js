@@ -90,7 +90,7 @@ function getImageInfo(buf) {
           marker <= 0xcf &&
           marker !== 0xc4 &&
           marker !== 0xc8 &&
-          marker !== 0xccc;
+          marker !== 0xcc;
         if (isSOF) {
           const height = buf.readUInt16BE(i + 5);
           const width = buf.readUInt16BE(i + 7);
@@ -207,7 +207,7 @@ export default async function handler(req, res) {
       "\n\n" +
       "QUY TẮC:\n" +
       "- point và to_point dùng tọa độ chuẩn hóa 0-1000 theo THỨ TỰ [y,x] (y trước, x sau; y là chiều dọc, x là chiều ngang).\n" +
-      "- QUY TẮC MÀN HÌNH NGÀY SINH: Nếu phát hiện màn hình chọn ngày sinh (có dòng chữ 'Ngày sinh của bạn là khi nào?', các ô cuộn Ngày/Tháng/Năm, hoặc cả khi hiển thị lỗi đỏ sai tuổi), BẮT BUỘC trả về action 'pick_date'. CẤM tuyệt đối dùng 'tap', 'type' hoặc 'fail' trên màn hình này.\n" +
+      "- MÀN HÌNH NGÀY SINH: Nếu thấy màn hình chọn ngày sinh (kể cả có dòng chữ đỏ lỗi thông tin/tuổi), BẮT BUỘC dùng action 'pick_date', CẤM dùng 'tap' hay 'fail'.\n" +
       "- tap: dùng khi có một phần tử nhìn thấy rõ cần chạm.\n" +
       "- swipe: dùng khi cần cuộn; point là điểm bắt đầu, to_point là điểm kết thúc.\n" +
       "- type: chỉ dùng khi ô nhập đã được chọn và có thể xác định rõ ô nhập; text chỉ lấy từ DỮ LIỆU ĐƯỢC PHÉP DÙNG.\n" +
@@ -350,11 +350,6 @@ export default async function handler(req, res) {
       result.seconds = Number.isFinite(s)
         ? Math.min(MAX_WAIT, Math.max(MIN_WAIT, s))
         : 2;
-    }
-
-    // Trả về trực tiếp cho các custom action không cần điểm/tọa độ đặc biệt
-    if (action === "pick_date" || action === "fill_name" || action === "done" || action === "fail") {
-      return res.status(200).json(result);
     }
 
     return res.status(200).json(result);
