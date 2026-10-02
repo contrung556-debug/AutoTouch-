@@ -1,7 +1,7 @@
 // ============================================================
 // pages/api/analyze.js
 // AUTOTOUCH VISION AGENT
-// VERSION: 5.2-name-plan-fix
+// VERSION: 5.3-name-password-plan-fix
 //
 // Gemini:
 //   - Primary: gemini-3.5-flash-lite
@@ -19,11 +19,37 @@
 //   done
 //   fail
 //
-// Important:
-//   - NAME SCREEN plan fixed
-//   - plan.steps[].action is the canonical format
-//   - type text must exist in INFO
-//   - no "Tiếp" inside name-entry plan
+// IMPORTANT FIXES:
+//
+// 1. NAME SCREEN
+//    BOTH EMPTY:
+//      tap Họ
+//      type Họ
+//      tap Tên
+//      type Tên
+//
+//    NEVER tap "Tiếp" inside name plan.
+//
+// 2. PASSWORD SCREEN
+//    PASSWORD ENTRY IS ONE TRANSACTION:
+//
+//      tap password
+//      type password
+//      tap Tiếp
+//
+//    DO NOT screenshot between type password and Tiếp.
+//
+//    After the password plan finishes, client captures a NEW
+//    screenshot and continues.
+//
+// 3. plan.steps[].action is canonical.
+//
+// 4. type text MUST exist in INFO.
+//
+// 5. No invented phone/password/name.
+//
+// 6. Gemini 2.5 is NOT used by default.
+//
 // ============================================================
 
 export const config = {
@@ -45,7 +71,7 @@ const MODEL_ID =
 const RECOVERY_MODEL =
   process.env.GEMINI_RECOVERY_MODEL || MODEL_ID;
 
-const VERSION = "5.2-name-plan-fix";
+const VERSION = "5.3-name-password-plan-fix";
 
 const ATTEMPTS = 2;
 const TIMEOUT_MS = 22000;
@@ -67,6 +93,11 @@ const ALLOWED_ACTIONS = [
   "restart",
   "done",
   "fail",
+];
+
+const PLAN_STEP_ACTIONS = [
+  "tap",
+  "type",
 ];
 
 // ============================================================
@@ -111,7 +142,10 @@ function normalizeImage(input) {
 
   let s = input.trim();
 
+  // ----------------------------------------------------------
   // data:image/png;base64,...
+  // ----------------------------------------------------------
+
   if (s.startsWith("data:image/")) {
     const comma = s.indexOf(",");
 
@@ -146,7 +180,10 @@ function normalizeImage(input) {
     };
   }
 
+  // ----------------------------------------------------------
   // raw base64
+  // ----------------------------------------------------------
+
   s = s.replace(/\s+/g, "");
 
   if (!s) {
@@ -167,7 +204,10 @@ function getImageSize(image) {
   try {
     const buffer = Buffer.from(image.data, "base64");
 
+    // --------------------------------------------------------
     // PNG
+    // --------------------------------------------------------
+
     if (
       buffer.length >= 24 &&
       buffer[0] === 0x89 &&
@@ -181,7 +221,10 @@ function getImageSize(image) {
       };
     }
 
+    // --------------------------------------------------------
     // JPEG
+    // --------------------------------------------------------
+
     if (
       buffer.length >= 2 &&
       buffer[0] === 0xff &&
@@ -197,7 +240,6 @@ function getImageSize(image) {
 
         const marker = buffer[offset + 1];
 
-        // SOF markers
         const isSOF =
           marker === 0xc0 ||
           marker === 0xc1 ||
@@ -214,8 +256,11 @@ function getImageSize(image) {
           marker === 0xcf;
 
         if (isSOF) {
-          const height = buffer.readUInt16BE(offset + 5);
-          const width = buffer.readUInt16BE(offset + 7);
+          const height =
+            buffer.readUInt16BE(offset + 5);
+
+          const width =
+            buffer.readUInt16BE(offset + 7);
 
           return {
             width,
@@ -227,9 +272,13 @@ function getImageSize(image) {
           break;
         }
 
-        const segmentLength = buffer.readUInt16BE(offset + 2);
+        const segmentLength =
+          buffer.readUInt16BE(offset + 2);
 
-        if (!segmentLength || segmentLength < 2) {
+        if (
+          !segmentLength ||
+          segmentLength < 2
+        ) {
           break;
         }
 
@@ -237,7 +286,7 @@ function getImageSize(image) {
       }
     }
   } catch {
-    // ignore
+    // Ignore image-size parsing errors.
   }
 
   return {
@@ -249,8 +298,8 @@ function getImageSize(image) {
 // ============================================================
 // COORDINATE NORMALIZATION
 //
-// Gemini is instructed to use 0..1000 coordinates.
-// AutoTouch/client receives actual screenshot pixels.
+// Gemini returns 0..1000 coordinates.
+// AutoTouch receives actual screenshot pixels.
 // ============================================================
 
 function normalizeXY(x, y, width, height) {
@@ -264,7 +313,10 @@ function normalizeXY(x, y, width, height) {
     };
   }
 
-  // 0..1000 coordinate system
+  // ----------------------------------------------------------
+  // Gemini coordinate system
+  // ----------------------------------------------------------
+
   if (
     nx >= 0 &&
     nx <= 1000 &&
@@ -276,6 +328,10 @@ function normalizeXY(x, y, width, height) {
     nx = (nx / 1000) * width;
     ny = (ny / 1000) * height;
   }
+
+  // ----------------------------------------------------------
+  // Clamp to screenshot
+  // ----------------------------------------------------------
 
   if (width) {
     nx = clamp(nx, 0, width - 1);
@@ -293,6 +349,17 @@ function normalizeXY(x, y, width, height) {
 
 // ============================================================
 // TEXT VALIDATION
+// ============================================================
+//
+// IMPORTANT:
+// AI is never allowed to type text that is not present in INFO.
+//
+// This applies to:
+// - name
+// - phone
+// - password
+// - any other generated text
+//
 // ============================================================
 
 function textAllowed(text, info) {
@@ -312,34 +379,240 @@ function textAllowed(text, info) {
 }
 
 // ============================================================
+// PLAN PURPOSE
+// ============================================================
+//
+// Optional semantic label generated by Gemini:
+//
+//   "name"
+//   "password"
+//   "phone"
+//   "generic"
+//
+// The server does not trust this blindly.
+// It still validates every step.
+//
+// ============================================================
+
+function normalizePlanPurpose(value) {
+  const p = cleanText(value).toLowerCase();
+
+  if (
+    p === "name" ||
+    p === "password" ||
+    p === "phone" ||
+    p === "generic"
+  ) {
+    return p;
+  }
+
+  return "";
+}
+
+// ============================================================
+// VALIDATE NAME PLAN
+// ============================================================
+//
+// Allowed:
+//
+//   tap
+//   type
+//   tap
+//   type
+//
+// No Tiếp tap.
+//
+// We cannot semantically identify the button from coordinates,
+// therefore the strongest server-side protection is:
+//
+// - exactly 4 steps
+// - alternating tap/type
+// - two type values must exist in INFO
+//
+// Gemini is additionally instructed to use current screenshot
+// coordinates for Họ and Tên.
+//
+// ============================================================
+
+function validateNamePlan(steps) {
+  if (!Array.isArray(steps)) {
+    return {
+      ok: false,
+      reason: "Name plan không hợp lệ: steps không phải array.",
+    };
+  }
+
+  if (steps.length !== 4) {
+    return {
+      ok: false,
+      reason:
+        "Name plan phải có đúng 4 bước: tap Họ -> type Họ -> tap Tên -> type Tên.",
+    };
+  }
+
+  if (steps[0]?.action !== "tap") {
+    return {
+      ok: false,
+      reason:
+        "Name plan bước 1 phải là tap vào ô Họ.",
+    };
+  }
+
+  if (steps[1]?.action !== "type") {
+    return {
+      ok: false,
+      reason:
+        "Name plan bước 2 phải là type Họ.",
+    };
+  }
+
+  if (steps[2]?.action !== "tap") {
+    return {
+      ok: false,
+      reason:
+        "Name plan bước 3 phải là tap vào ô Tên.",
+    };
+  }
+
+  if (steps[3]?.action !== "type") {
+    return {
+      ok: false,
+      reason:
+        "Name plan bước 4 phải là type Tên.",
+    };
+  }
+
+  return {
+    ok: true,
+  };
+}
+
+// ============================================================
+// VALIDATE PASSWORD PLAN
+// ============================================================
+//
+// IMPORTANT:
+//
+// Password must be:
+//
+//   tap password
+//   type password
+//   tap Tiếp
+//
+// SAME PLAN.
+//
+// There must NOT be a screenshot/action boundary between
+// password type and Tiếp.
+//
+// ============================================================
+
+function validatePasswordPlan(
+  steps,
+  info
+) {
+  if (!Array.isArray(steps)) {
+    return {
+      ok: false,
+      reason:
+        "Password plan không hợp lệ: steps không phải array.",
+    };
+  }
+
+  if (steps.length !== 3) {
+    return {
+      ok: false,
+      reason:
+        "Password plan phải có đúng 3 bước: tap password -> type password -> tap Tiếp.",
+    };
+  }
+
+  if (steps[0]?.action !== "tap") {
+    return {
+      ok: false,
+      reason:
+        "Password plan bước 1 phải là tap vào ô mật khẩu.",
+    };
+  }
+
+  if (steps[1]?.action !== "type") {
+    return {
+      ok: false,
+      reason:
+        "Password plan bước 2 phải là type password.",
+    };
+  }
+
+  if (steps[2]?.action !== "tap") {
+    return {
+      ok: false,
+      reason:
+        "Password plan bước 3 phải là tap Tiếp.",
+    };
+  }
+
+  const password = cleanText(
+    steps[1]?.text
+  );
+
+  if (!password) {
+    return {
+      ok: false,
+      reason:
+        "Password plan không có password.",
+    };
+  }
+
+  if (!textAllowed(password, info)) {
+    return {
+      ok: false,
+      reason:
+        "Password plan chứa password không tồn tại trong INFO.",
+    };
+  }
+
+  return {
+    ok: true,
+  };
+}
+
+// ============================================================
 // NORMALIZE PLAN STEP
 // ============================================================
 
-function normalizePlanStep(step, info, width, height) {
-  if (!step || typeof step !== "object") {
+function normalizePlanStep(
+  step,
+  info,
+  width,
+  height
+) {
+  if (
+    !step ||
+    typeof step !== "object"
+  ) {
     return null;
   }
 
   // ----------------------------------------------------------
-  // IMPORTANT:
-  // canonical field is step.action
+  // CANONICAL FORMAT:
   //
-  // We DO NOT accept:
-  // { type: "tap" }
-  //
-  // We accept:
   // { action: "tap" }
+  // { action: "type" }
+  //
+  // DO NOT accept:
+  //
+  // { type: "tap" }
   // ----------------------------------------------------------
 
-  const action = cleanText(step.action).toLowerCase();
+  const action =
+    cleanText(step.action).toLowerCase();
 
-  if (!["tap", "type"].includes(action)) {
+  if (!PLAN_STEP_ACTIONS.includes(action)) {
     return null;
   }
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // TAP
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (action === "tap") {
     const point = normalizeXY(
@@ -363,12 +636,14 @@ function normalizePlanStep(step, info, width, height) {
     };
   }
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // TYPE
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (action === "type") {
-    const text = cleanText(step.text);
+    const text = cleanText(
+      step.text
+    );
 
     if (!text) {
       return null;
@@ -391,27 +666,37 @@ function normalizePlanStep(step, info, width, height) {
 // NORMALIZE ACTION
 // ============================================================
 
-function normalizeAction(raw, info, width, height) {
-  if (!raw || typeof raw !== "object") {
+function normalizeAction(
+  raw,
+  info,
+  width,
+  height
+) {
+  if (
+    !raw ||
+    typeof raw !== "object"
+  ) {
     return {
       action: "fail",
-      reason: "AI returned an invalid action object.",
+      reason:
+        "AI returned an invalid action object.",
     };
   }
 
-  let action = cleanText(raw.action).toLowerCase();
+  let action =
+    cleanText(raw.action).toLowerCase();
 
   // ----------------------------------------------------------
-  // Small compatibility layer.
-  //
-  // The model MUST still return "action", but this prevents
-  // harmless capitalization problems.
+  // ONLY CANONICAL ACTION FIELD
   // ----------------------------------------------------------
 
   if (!ALLOWED_ACTIONS.includes(action)) {
     return {
       action: "fail",
-      reason: `Unsupported action: ${action || "empty"}`,
+      reason:
+        `Unsupported action: ${
+          action || "empty"
+        }`,
     };
   }
 
@@ -433,7 +718,8 @@ function normalizeAction(raw, info, width, height) {
     ) {
       return {
         action: "fail",
-        reason: "Tap coordinates are invalid.",
+        reason:
+          "Tap coordinates are invalid.",
       };
     }
 
@@ -472,7 +758,8 @@ function normalizeAction(raw, info, width, height) {
     ) {
       return {
         action: "fail",
-        reason: "Swipe coordinates are invalid.",
+        reason:
+          "Swipe coordinates are invalid.",
       };
     }
 
@@ -498,12 +785,15 @@ function normalizeAction(raw, info, width, height) {
   // ==========================================================
 
   if (action === "type") {
-    const text = cleanText(raw.text);
+    const text = cleanText(
+      raw.text
+    );
 
     if (!text) {
       return {
         action: "fail",
-        reason: "Type text is empty.",
+        reason:
+          "Type text is empty.",
       };
     }
 
@@ -547,14 +837,21 @@ function normalizeAction(raw, info, width, height) {
   if (action === "wheel") {
     const rows = num(raw.rows);
 
-    if (rows === null || rows === 0) {
+    if (
+      rows === null ||
+      rows === 0
+    ) {
       return {
         action: "fail",
-        reason: "Wheel rows are invalid.",
+        reason:
+          "Wheel rows are invalid.",
       };
     }
 
-    if (Math.abs(rows) > MAX_WHEEL_ROWS) {
+    if (
+      Math.abs(rows) >
+      MAX_WHEEL_ROWS
+    ) {
       return {
         action: "fail",
         reason:
@@ -575,7 +872,8 @@ function normalizeAction(raw, info, width, height) {
     ) {
       return {
         action: "fail",
-        reason: "Wheel coordinates are invalid.",
+        reason:
+          "Wheel coordinates are invalid.",
       };
     }
 
@@ -594,39 +892,29 @@ function normalizeAction(raw, info, width, height) {
 
   if (action === "plan") {
     // --------------------------------------------------------
-    // The biggest fix:
-    //
-    // Gemini must return:
-    //
-    // {
-    //   "action": "plan",
-    //   "steps": [
-    //      {"action":"tap",...},
-    //      {"action":"type","text":"..."},
-    //      ...
-    //   ]
-    // }
-    //
-    // NOT:
-    //
-    // {"type":"tap"}
+    // Basic validation
     // --------------------------------------------------------
 
     if (!Array.isArray(raw.steps)) {
       return {
         action: "fail",
-        reason: "Plan không hợp lệ: thiếu steps.",
+        reason:
+          "Plan không hợp lệ: thiếu steps.",
       };
     }
 
     if (raw.steps.length < 1) {
       return {
         action: "fail",
-        reason: "Plan không hợp lệ: steps rỗng.",
+        reason:
+          "Plan không hợp lệ: steps rỗng.",
       };
     }
 
-    if (raw.steps.length > MAX_PLAN_STEPS) {
+    if (
+      raw.steps.length >
+      MAX_PLAN_STEPS
+    ) {
       return {
         action: "fail",
         reason:
@@ -634,21 +922,26 @@ function normalizeAction(raw, info, width, height) {
       };
     }
 
+    // --------------------------------------------------------
+    // Normalize every step.
+    // --------------------------------------------------------
+
     const steps = [];
 
     for (const step of raw.steps) {
-      const normalized = normalizePlanStep(
-        step,
-        info,
-        width,
-        height
-      );
+      const normalized =
+        normalizePlanStep(
+          step,
+          info,
+          width,
+          height
+        );
 
       if (!normalized) {
         return {
           action: "fail",
           reason:
-            "Plan không hợp lệ: mỗi step phải là action='tap' hoặc action='type', và type phải nằm trong INFO.",
+            "Plan không hợp lệ: mỗi step phải dùng action='tap' hoặc action='type', và type phải nằm trong INFO.",
         };
       }
 
@@ -656,26 +949,81 @@ function normalizeAction(raw, info, width, height) {
     }
 
     // --------------------------------------------------------
-    // NAME SCREEN SAFETY
-    //
-    // Never allow "Tiếp" inside the same name-entry plan.
-    // We cannot reliably know the button coordinate, so the
-    // server enforces the plan structure only:
-    //
-    // tap Họ
-    // type Họ
-    // tap Tên
-    // type Tên
-    //
-    // A client screenshot after the plan decides next action.
+    // PLAN PURPOSE
     // --------------------------------------------------------
 
-    const reason = str(raw.reason);
+    const purpose =
+      normalizePlanPurpose(
+        raw.purpose
+      );
+
+    // ========================================================
+    // NAME PLAN
+    // ========================================================
+
+    if (purpose === "name") {
+      const check =
+        validateNamePlan(steps);
+
+      if (!check.ok) {
+        return {
+          action: "fail",
+          reason: check.reason,
+        };
+      }
+
+      // ------------------------------------------------------
+      // Explicitly reject any accidental Tiếp step.
+      //
+      // Since tap has no text, we rely on Gemini's required
+      // purpose/structure and current screenshot.
+      // ------------------------------------------------------
+
+      return {
+        action: "plan",
+        purpose: "name",
+        steps,
+        reason: str(raw.reason),
+      };
+    }
+
+    // ========================================================
+    // PASSWORD PLAN
+    // ========================================================
+
+    if (purpose === "password") {
+      const check =
+        validatePasswordPlan(
+          steps,
+          info
+        );
+
+      if (!check.ok) {
+        return {
+          action: "fail",
+          reason: check.reason,
+        };
+      }
+
+      return {
+        action: "plan",
+        purpose: "password",
+        steps,
+        reason: str(raw.reason),
+      };
+    }
+
+    // ========================================================
+    // GENERIC PLAN
+    // ========================================================
 
     return {
       action: "plan",
+      ...(purpose
+        ? { purpose }
+        : {}),
       steps,
-      reason,
+      reason: str(raw.reason),
     };
   }
 
@@ -727,7 +1075,8 @@ function normalizeAction(raw, info, width, height) {
 
   return {
     action: "fail",
-    reason: "Unknown action.",
+    reason:
+      "Unknown action.",
   };
 }
 
@@ -744,9 +1093,9 @@ const SYSTEM_RULES = [
   "Never invent passwords.",
   "Never use information that is not present in INFO.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // COORDINATES
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "COORDINATES:",
   "- Return x/y in a 0..1000 coordinate system.",
@@ -754,10 +1103,11 @@ const SYSTEM_RULES = [
   "- y=0 is top, y=1000 is bottom.",
   "- Tap the center of the actual visible control.",
   "- Never tap based on a remembered coordinate from an old screenshot.",
+  "- Coordinates MUST come from the CURRENT screenshot.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // LOADING
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "LOADING / SPINNER:",
   "- If a button displays a spinner/loading indicator instead of normal text, do NOT treat the spinner as the target text.",
@@ -766,9 +1116,9 @@ const SYSTEM_RULES = [
   "- Never repeat-click a loading button.",
   "- Prefer wait 2-3 seconds.",
 
-  // ----------------------------------------------------------
-  // EXISTING INPUT
-  // ----------------------------------------------------------
+  // ==========================================================
+  // INPUT ALREADY FILLED
+  // ==========================================================
 
   "INPUT ALREADY FILLED:",
   "- If an input already contains the correct value, do not type it again.",
@@ -777,41 +1127,41 @@ const SYSTEM_RULES = [
   "- Do not append duplicate text.",
   "- Only type into an empty or clearly incomplete field.",
 
-  // ----------------------------------------------------------
-  // FACEBOOK WELCOME
-  // ----------------------------------------------------------
+  // ==========================================================
+  // WELCOME
+  // ==========================================================
 
   "WELCOME SCREEN:",
   "- If the visible screen has 'Tham gia Facebook' and a button 'Bắt đầu', tap 'Bắt đầu'.",
   "- Never choose 'Tôi có trang cá nhân rồi' for this flow.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // CREATE ACCOUNT
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "CREATE ACCOUNT SCREEN:",
   "- If the screen says 'Tham gia Facebook' and shows 'Tạo tài khoản mới', tap 'Tạo tài khoản mới'.",
   "- Never choose 'Tìm tài khoản của tôi'.",
   "- Do not press back when the create-account option is visible.",
 
-  // ----------------------------------------------------------
-  // LOGIN SCREEN
-  // ----------------------------------------------------------
+  // ==========================================================
+  // LOGIN
+  // ==========================================================
 
   "LOGIN SCREEN:",
   "- If login fields are visible and 'Tạo tài khoản mới' is visible, tap 'Tạo tài khoản mới'.",
   "- Do not enter credentials into the login screen.",
   "- Do not press login.",
 
-  // ----------------------------------------------------------
-  // META ACCOUNT
-  // ----------------------------------------------------------
+  // ==========================================================
+  // META
+  // ==========================================================
 
   "META ACCOUNT SCREEN:",
   "- If 'Bắt đầu trên Facebook bằng Tài khoản Meta' is visible with 'Bắt đầu', tap 'Bắt đầu'.",
 
   // ==========================================================
-  // NAME SCREEN - IMPORTANT FIX
+  // NAME SCREEN
   // ==========================================================
 
   "NAME SCREEN - BAN TEN GI:",
@@ -819,16 +1169,25 @@ const SYSTEM_RULES = [
 
   "- If BOTH Họ and Tên are empty:",
   "  + MUST return action='plan'.",
-  "  + The plan MUST contain tap Họ -> type Họ -> tap Tên -> type Tên.",
+  "  + MUST set purpose='name'.",
+  "  + The plan MUST contain exactly:",
+  "    1. tap Họ",
+  "    2. type exact Họ from INFO",
+  "    3. tap Tên",
+  "    4. type exact Tên from INFO",
   "  + Do NOT tap 'Tiếp' in this same plan.",
   "  + Do NOT type both names into one field.",
   "  + Use coordinates from the CURRENT screenshot.",
   "  + Do not use hard-coded coordinates.",
 
   "- If Họ is empty and Tên already contains the correct value:",
+  "  + Return action='plan'.",
+  "  + purpose='name'.",
   "  + Plan only Họ: tap Họ -> type Họ.",
 
   "- If Tên is empty and Họ already contains the correct value:",
+  "  + Return action='plan'.",
+  "  + purpose='name'.",
   "  + Plan only Tên: tap Tên -> type Tên.",
 
   "- If both Họ and Tên already contain the correct values:",
@@ -836,14 +1195,15 @@ const SYSTEM_RULES = [
   "  + The next screenshot may then allow tapping 'Tiếp'.",
 
   "- The name-entry plan MUST NOT contain a tap on 'Tiếp'.",
+  "- The name-entry plan MUST NOT contain a third tap.",
   "- After executing the name-entry plan, the client MUST capture a NEW screenshot before another action.",
   "- Never tap keyboard suggestions.",
   "- Never tap keyboard keys manually.",
   "- Never tap the microphone, globe, spacebar, delete, or 'Xong' unless explicitly required by the UI flow.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // BIRTH DATE
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "BIRTH DATE:",
   "- If a wheel date picker is visible, use wheel actions only.",
@@ -858,89 +1218,107 @@ const SYSTEM_RULES = [
   "- Verify the displayed date before tapping 'Tiếp'.",
   "- Do not swipe randomly on a wheel.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // PHONE
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "MOBILE NUMBER:",
   "- Use only the exact allowed phone number from INFO.",
-  "- If phone field is empty, plan tap -> type exact phone.",
-  "- After entering phone, client must capture a new screenshot.",
-  "- Only then decide whether to tap 'Tiếp'.",
+  "- If phone field is empty, return a plan.",
+  "- The phone plan should be: tap phone field -> type exact phone.",
+  "- Do not invent another phone number.",
+  "- After entering phone, the client must capture a new screenshot.",
+  "- Only after the new screenshot decide whether to tap 'Tiếp'.",
   "- If Facebook reports invalid or already-used number, return fail.",
-  "- Never invent another phone number.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // PASSWORD
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "PASSWORD:",
   "- Use only the exact allowed password from INFO.",
-  "- If password field is empty, plan tap -> type exact password.",
-  "- If masked dots are already visible, do not type again.",
-  "- Do not tap the remember-password checkbox.",
+  "- NEVER invent another password.",
+  "- If the password field is already visibly filled with masked dots, do NOT type again.",
+  "- IMPORTANT: after typing a password, the password field may LOOK EMPTY in a screenshot because iOS/Facebook masks or hides the text.",
+  "- Therefore, NEVER conclude that the password was not entered merely because the next screenshot appears to show an empty password field.",
+  "- IMPORTANT: PASSWORD ENTRY IS ONE TRANSACTION.",
+  "- If the password field is empty AND the visible 'Tiếp' button is available, return action='plan'.",
+  "- MUST set purpose='password'.",
+  "- The password plan MUST contain exactly 3 steps:",
+  "  1. tap the visible password field",
+  "  2. type the exact password from INFO",
+  "  3. tap the visible 'Tiếp' button",
+  "- DO NOT insert wait between password type and 'Tiếp'.",
+  "- DO NOT insert screenshot/check between password type and 'Tiếp'.",
+  "- DO NOT return only tap password.",
+  "- DO NOT return only type password.",
+  "- DO NOT return a password plan without the final 'Tiếp' tap.",
+  "- After the password plan has been executed, the client MUST capture a NEW screenshot.",
+  "- On that NEW screenshot, NEVER type the password again solely because the password field looks empty.",
+  "- If the new screenshot shows an actual password error, diagnose the error from the current UI before taking another action.",
   "- Do not tap the password eye icon.",
-  "- After entering password, client must capture a new screenshot.",
+  "- Do not tap the remember-password checkbox.",
+  "- Do not tap keyboard keys manually.",
 
-  // ----------------------------------------------------------
-  // CAPTCHA / OTP
-  // ----------------------------------------------------------
+  // ==========================================================
+  // CAPTCHA / OTP / IDENTITY
+  // ==========================================================
 
   "CAPTCHA / OTP / IDENTITY:",
   "- If CAPTCHA, OTP, identity verification, suspicious login verification, or similar verification is visible, return wait.",
   "- Do not attempt to solve verification automatically.",
   "- If the same verification screen remains unchanged after 3 consecutive waits, return fail.",
 
-  // ----------------------------------------------------------
-  // APP OPEN / SPLASH
-  // ----------------------------------------------------------
+  // ==========================================================
+  // APP SPLASH
+  // ==========================================================
 
   "APP SPLASH:",
   "- If Facebook or Meta logo splash screen is visible, return wait.",
   "- Do not return launch while the splash is already visible.",
   "- Wait approximately 3 seconds.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // HOME / APP SWITCHER
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "HOME SCREEN / APP SWITCHER:",
   "- If the device is at iOS Home Screen or app switcher instead of Facebook, return launch.",
   "- launch means the client should open Facebook again.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // APP ERROR
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "APP ERROR:",
   "- If the page says 'Trang này hiện không hiển thị' or clearly indicates a technical Facebook page error, return restart.",
   "- Do not simply tap 'Làm mới' for this type of technical error.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // DEVICE LOCK
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "DEVICE LOCK:",
   "- If device passcode/lock screen is visible, return fail.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // REOPEN
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "REOPEN HISTORY:",
   "- If history contains 'App vừa được mở lại', ignore old UI assumptions.",
   "- Evaluate only the current screenshot.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // SUCCESS
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "SUCCESS:",
   "- If Facebook feed/home has been reached and signup flow is complete, return done.",
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // REOPEN LIMIT
-  // ----------------------------------------------------------
+  // ==========================================================
 
   "REOPEN LIMIT:",
   "- If the app has been reopened 3 or more times and still does not reach the expected flow, return fail.",
@@ -950,17 +1328,28 @@ const SYSTEM_RULES = [
 // RECOVERY BLOCK
 // ============================================================
 
-function buildRecoveryBlock(failure) {
-  if (!failure || typeof failure !== "object") {
+function buildRecoveryBlock(
+  failure
+) {
+  if (
+    !failure ||
+    typeof failure !== "object"
+  ) {
     return "";
   }
 
-  const reason = cleanText(failure.reason);
-  const previousAction = cleanText(
-    failure.previous_action
-  );
+  const reason =
+    cleanText(failure.reason);
 
-  if (!reason && !previousAction) {
+  const previousAction =
+    cleanText(
+      failure.previous_action
+    );
+
+  if (
+    !reason &&
+    !previousAction
+  ) {
     return "";
   }
 
@@ -976,8 +1365,12 @@ function buildRecoveryBlock(failure) {
     "- If a technical Facebook error page is visible, return restart.",
     "- If the action is genuinely impossible, return fail.",
     "",
-    `Previous action: ${previousAction || "unknown"}`,
-    `Failure reason: ${reason || "unknown"}`,
+    `Previous action: ${
+      previousAction || "unknown"
+    }`,
+    `Failure reason: ${
+      reason || "unknown"
+    }`,
   ].join("\n");
 }
 
@@ -993,79 +1386,118 @@ function buildPrompt({
   mode,
   failure,
 }) {
-  const clientRules = Array.isArray(rules)
-    ? rules
-        .filter(Boolean)
-        .map((x) => String(x))
-        .join("\n")
-    : "";
+  const clientRules =
+    Array.isArray(rules)
+      ? rules
+          .filter(Boolean)
+          .map((x) => String(x))
+          .join("\n")
+      : "";
 
-  const historyText = Array.isArray(history)
-    ? history
-        .slice(-20)
-        .map((x) => String(x))
-        .join("\n")
-    : "";
+  const historyText =
+    Array.isArray(history)
+      ? history
+          .slice(-20)
+          .map((x) => String(x))
+          .join("\n")
+      : "";
 
   const recovery =
     mode === "recover"
-      ? buildRecoveryBlock(failure)
+      ? buildRecoveryBlock(
+          failure
+        )
       : "";
 
   return [
     "CURRENT TASK:",
-    cleanText(goal) || "Complete the current signup flow.",
+    cleanText(goal) ||
+      "Complete the current Facebook signup flow.",
+
     "",
+
     "INFO:",
     String(info || ""),
+
     "",
+
     "CLIENT RULES:",
     clientRules || "(none)",
+
     "",
+
     "HISTORY:",
     historyText || "(none)",
+
     "",
+
     SYSTEM_RULES,
+
     recovery,
+
     "",
+
     "OUTPUT REQUIREMENTS:",
     "- Return ONE JSON object only.",
     "- No markdown.",
     "- No explanation outside JSON.",
     "- action must be one of: tap, swipe, type, wait, wheel, plan, launch, restart, done, fail.",
+
     "",
-    "FOR PLAN:",
-    "- plan.steps must be an array.",
+
+    "IMPORTANT PLAN FORMAT:",
+    "- plan.steps MUST be an array.",
     "- Every step MUST use field 'action'.",
-    "- Valid step action values are ONLY 'tap' and 'type'.",
-    "- Tap step: {action:'tap', x:number, y:number}.",
-    "- Type step: {action:'type', text:string}.",
-    "- Do not use step.type as the action field.",
-    "- Do not put 'Tiếp' inside the name-entry plan.",
+    "- Never use step.type as the action field.",
+    "- Valid step actions are ONLY 'tap' and 'type'.",
+
     "",
-    "JSON SHAPES:",
+
+    "NAME PLAN FORMAT:",
+    '- Use purpose="name".',
+    '- Both empty: exactly 4 steps:',
+    '  {"action":"tap","x":...,"y":...}',
+    '  {"action":"type","text":"Họ"}',
+    '  {"action":"tap","x":...,"y":...}',
+    '  {"action":"type","text":"Tên"}',
+    "- NEVER put 'Tiếp' inside name plan.",
+
     "",
+
+    "PASSWORD PLAN FORMAT:",
+    '- Use purpose="password".',
+    '- EXACTLY 3 steps:',
+    '  {"action":"tap","x":...,"y":...}',
+    '  {"action":"type","text":"PASSWORD_FROM_INFO"}',
+    '  {"action":"tap","x":...,"y":...}',
+    "- The third tap MUST be the visible 'Tiếp' button.",
+    "- Do NOT add wait between password type and Tiếp.",
+    "- Do NOT create a screenshot/check step between password type and Tiếp.",
+    "- Password is entered ONLY ONCE.",
+    "- After this plan finishes, the client captures a NEW screenshot.",
+
+    "",
+
+    "GENERIC JSON SHAPES:",
+
     '{"action":"tap","x":500,"y":500,"reason":"..."}',
-    "",
+
     '{"action":"type","text":"Phạm","reason":"..."}',
-    "",
+
     '{"action":"wait","seconds":3,"reason":"..."}',
-    "",
+
     '{"action":"wheel","x":500,"y":500,"rows":3,"reason":"..."}',
-    "",
-    '{"action":"plan","steps":[' +
-      '{"action":"tap","x":250,"y":450},' +
-      '{"action":"type","text":"Phạm"},' +
-      '{"action":"tap","x":750,"y":450},' +
-      '{"action":"type","text":"Thu Hà"}' +
-      '],"reason":"Nhập Họ và Tên"}',
-    "",
+
+    '{"action":"plan","purpose":"name","steps":[{"action":"tap","x":250,"y":450},{"action":"type","text":"Phạm"},{"action":"tap","x":750,"y":450},{"action":"type","text":"Thu Hà"}],"reason":"Nhập Họ và Tên"}',
+
+    '{"action":"plan","purpose":"password","steps":[{"action":"tap","x":500,"y":450},{"action":"type","text":"PASSWORD_FROM_INFO"},{"action":"tap","x":500,"y":800}],"reason":"Nhập mật khẩu và bấm Tiếp"}',
+
     '{"action":"launch","reason":"..."}',
-    "",
+
     '{"action":"restart","reason":"..."}',
-    "",
+
     '{"action":"done","reason":"..."}',
-    "",
+
     '{"action":"fail","reason":"..."}',
   ].join("\n");
 }
@@ -1080,16 +1512,22 @@ async function callGemini({
   image,
   prompt,
 }) {
-  const controller = new AbortController();
+  const controller =
+    new AbortController();
 
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, TIMEOUT_MS);
+  const timeout =
+    setTimeout(() => {
+      controller.abort();
+    }, TIMEOUT_MS);
 
   try {
     const url =
-      `${GEMINI_BASE}/${encodeURIComponent(model)}` +
-      `:generateContent?key=${encodeURIComponent(key)}`;
+      `${GEMINI_BASE}/${encodeURIComponent(
+        model
+      )}` +
+      `:generateContent?key=${encodeURIComponent(
+        key
+      )}`;
 
     const body = {
       systemInstruction: {
@@ -1098,7 +1536,9 @@ async function callGemini({
             text:
               "Return strict JSON only. " +
               "You are a vision controller. " +
-              "Follow the system rules exactly.",
+              "Follow the system rules exactly. " +
+              "Never invent credentials. " +
+              "Password must be entered only once in the password plan.",
           },
         ],
       },
@@ -1109,8 +1549,10 @@ async function callGemini({
           parts: [
             {
               inlineData: {
-                mimeType: image.mimeType,
-                data: image.data,
+                mimeType:
+                  image.mimeType,
+                data:
+                  image.data,
               },
             },
             {
@@ -1123,35 +1565,45 @@ async function callGemini({
       generationConfig: {
         temperature: 0,
         maxOutputTokens: 1024,
-        responseMimeType: "application/json",
+        responseMimeType:
+          "application/json",
       },
     };
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    const response =
+      await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type":
+            "application/json",
+        },
+        body:
+          JSON.stringify(body),
+        signal:
+          controller.signal,
+      });
 
     let payload = null;
 
     try {
-      payload = await response.json();
+      payload =
+        await response.json();
     } catch {
       payload = null;
     }
 
     if (!response.ok) {
-      const error = new Error(
-        payload?.error?.message ||
-          `Gemini HTTP ${response.status}`
-      );
+      const error =
+        new Error(
+          payload?.error?.message ||
+            `Gemini HTTP ${response.status}`
+        );
 
-      error.status = response.status;
-      error.payload = payload;
+      error.status =
+        response.status;
+
+      error.payload =
+        payload;
 
       throw error;
     }
@@ -1166,15 +1618,21 @@ async function callGemini({
 // EXTRACT GEMINI TEXT
 // ============================================================
 
-function extractGeminiText(payload) {
+function extractGeminiText(
+  payload
+) {
   const text =
     payload?.candidates?.[0]?.content?.parts
-      ?.map((p) => p?.text || "")
+      ?.map(
+        (p) => p?.text || ""
+      )
       .join("")
       .trim();
 
   if (!text) {
-    throw new Error("GEMINI_EMPTY_RESPONSE");
+    throw new Error(
+      "GEMINI_EMPTY_RESPONSE"
+    );
   }
 
   return text;
@@ -1185,37 +1643,72 @@ function extractGeminiText(payload) {
 // ============================================================
 
 function parseModelJSON(text) {
-  let source = String(text || "").trim();
+  let source =
+    String(text || "").trim();
 
-  // Remove accidental markdown fences
+  // ----------------------------------------------------------
+  // Remove accidental markdown fences.
+  // ----------------------------------------------------------
+
   source = source
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/\s*```$/i, "")
+    .replace(
+      /^```json\s*/i,
+      ""
+    )
+    .replace(
+      /^```\s*/i,
+      ""
+    )
+    .replace(
+      /\s*```$/i,
+      ""
+    )
     .trim();
 
-  try {
-    return JSON.parse(source);
-  } catch {
-    // Try extracting first JSON object
-    const start = source.indexOf("{");
-    const end = source.lastIndexOf("}");
+  // ----------------------------------------------------------
+  // Direct JSON.
+  // ----------------------------------------------------------
 
-    if (start >= 0 && end > start) {
-      const candidate = source.slice(
+  try {
+    return JSON.parse(
+      source
+    );
+  } catch {
+    // Continue.
+  }
+
+  // ----------------------------------------------------------
+  // Extract first JSON object.
+  // ----------------------------------------------------------
+
+  const start =
+    source.indexOf("{");
+
+  const end =
+    source.lastIndexOf("}");
+
+  if (
+    start >= 0 &&
+    end > start
+  ) {
+    const candidate =
+      source.slice(
         start,
         end + 1
       );
 
-      try {
-        return JSON.parse(candidate);
-      } catch {
-        // continue
-      }
+    try {
+      return JSON.parse(
+        candidate
+      );
+    } catch {
+      // Continue.
     }
   }
 
-  throw new Error("GEMINI_INVALID_JSON");
+  throw new Error(
+    "GEMINI_INVALID_JSON"
+  );
 }
 
 // ============================================================
@@ -1237,7 +1730,11 @@ async function askGemini({
 }) {
   let lastError = null;
 
-  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+  for (
+    let attempt = 1;
+    attempt <= ATTEMPTS;
+    attempt++
+  ) {
     try {
       return await callGemini({
         model,
@@ -1248,7 +1745,10 @@ async function askGemini({
     } catch (error) {
       lastError = error;
 
-      const status = Number(error?.status || 0);
+      const status =
+        Number(
+          error?.status || 0
+        );
 
       if (
         attempt >= ATTEMPTS ||
@@ -1257,23 +1757,41 @@ async function askGemini({
         throw error;
       }
 
-      await new Promise((resolve) =>
-        setTimeout(resolve, 600 * attempt)
+      await new Promise(
+        (resolve) =>
+          setTimeout(
+            resolve,
+            600 * attempt
+          )
       );
     }
   }
 
-  throw lastError || new Error("GEMINI_FAILED");
+  throw (
+    lastError ||
+    new Error(
+      "GEMINI_FAILED"
+    )
+  );
 }
 
 // ============================================================
 // FRIENDLY ERRORS
 // ============================================================
 
-function friendlyError(error, model) {
-  const status = Number(error?.status || 0);
+function friendlyError(
+  error,
+  model
+) {
+  const status =
+    Number(
+      error?.status || 0
+    );
 
-  if (error?.name === "AbortError") {
+  if (
+    error?.name ===
+    "AbortError"
+  ) {
     return "Gemini timeout.";
   }
 
@@ -1311,7 +1829,10 @@ function friendlyError(error, model) {
 }
 
 function isFatal(error) {
-  const status = Number(error?.status || 0);
+  const status =
+    Number(
+      error?.status || 0
+    );
 
   return (
     status === 400 ||
@@ -1351,290 +1872,414 @@ function setCors(res) {
 // MAIN HANDLER
 // ============================================================
 
-export default async function handler(req, res) {
+export default async function handler(
+  req,
+  res
+) {
   setCors(res);
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // OPTIONS
-  // ----------------------------------------------------------
+  // ==========================================================
 
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
+  if (
+    req.method === "OPTIONS"
+  ) {
+    return res
+      .status(204)
+      .end();
   }
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // METHOD
-  // ----------------------------------------------------------
+  // ==========================================================
 
-  if (req.method !== "POST") {
-    return res.status(405).json({
-      success: false,
-      error: "Method not allowed.",
-      version: VERSION,
-    });
+  if (
+    req.method !== "POST"
+  ) {
+    return res
+      .status(405)
+      .json({
+        success: false,
+        error:
+          "Method not allowed.",
+        version: VERSION,
+      });
   }
 
   try {
     const body =
       req.body &&
-      typeof req.body === "object"
+      typeof req.body ===
+        "object"
         ? req.body
         : {};
 
-    // --------------------------------------------------------
+    // ========================================================
     // API KEY
-    //
-    // Recommended:
-    // GEMINI_API_KEY in Vercel Environment Variables.
-    //
-    // body.key is kept for compatibility with the current
-    // AutoTouch client.
-    // --------------------------------------------------------
+    // ========================================================
 
     const key =
       cleanText(body.key) ||
-      cleanText(process.env.GEMINI_API_KEY);
+      cleanText(
+        process.env.GEMINI_API_KEY
+      );
 
     if (!key) {
-      return res.status(200).json({
-        success: false,
-        error: "Missing GEMINI_API_KEY.",
-        version: VERSION,
-      });
+      return res
+        .status(200)
+        .json({
+          success: false,
+          error:
+            "Missing GEMINI_API_KEY.",
+          version: VERSION,
+        });
     }
 
-    // --------------------------------------------------------
+    // ========================================================
     // IMAGE
-    // --------------------------------------------------------
+    // ========================================================
 
     let image;
 
     try {
-      image = normalizeImage(body.image);
+      image =
+        normalizeImage(
+          body.image
+        );
     } catch (error) {
-      return res.status(200).json({
-        success: false,
-        error:
-          error?.message ||
-          "Invalid image.",
-        version: VERSION,
-      });
+      return res
+        .status(200)
+        .json({
+          success: false,
+          error:
+            error?.message ||
+            "Invalid image.",
+          version: VERSION,
+        });
     }
+
+    // ========================================================
+    // IMAGE SIZE
+    // ========================================================
 
     const {
       width: imageWidth,
       height: imageHeight,
-    } = getImageSize(image);
+    } = getImageSize(
+      image
+    );
 
-    // --------------------------------------------------------
+    // ========================================================
     // INPUTS
-    // --------------------------------------------------------
+    // ========================================================
 
     const goal =
       cleanText(body.goal) ||
       "Complete the current Facebook signup flow.";
 
     const info =
-      typeof body.info === "string"
+      typeof body.info ===
+      "string"
         ? body.info
         : "";
 
-    const rules = Array.isArray(body.rules)
-      ? body.rules
-      : [];
+    const rules =
+      Array.isArray(body.rules)
+        ? body.rules
+        : [];
 
-    const history = Array.isArray(body.history)
-      ? body.history
-      : [];
+    const history =
+      Array.isArray(
+        body.history
+      )
+        ? body.history
+        : [];
 
     const mode =
-      body.mode === "recover"
+      body.mode ===
+      "recover"
         ? "recover"
         : "normal";
 
     const failure =
       body.failure &&
-      typeof body.failure === "object"
+      typeof body.failure ===
+        "object"
         ? body.failure
         : null;
 
-    // --------------------------------------------------------
+    // ========================================================
     // PROMPT
-    // --------------------------------------------------------
+    // ========================================================
 
-    const prompt = buildPrompt({
-      goal,
-      info,
-      rules,
-      history,
-      mode,
-      failure,
-    });
+    const prompt =
+      buildPrompt({
+        goal,
+        info,
+        rules,
+        history,
+        mode,
+        failure,
+      });
 
-    // --------------------------------------------------------
+    // ========================================================
     // MODEL
-    // --------------------------------------------------------
+    // ========================================================
 
     const model =
       mode === "recover"
         ? RECOVERY_MODEL
         : MODEL_ID;
 
-    // --------------------------------------------------------
+    // ========================================================
     // GEMINI
-    // --------------------------------------------------------
+    // ========================================================
 
-    const payload = await askGemini({
-      model,
-      key,
-      image,
-      prompt,
-    });
+    const payload =
+      await askGemini({
+        model,
+        key,
+        image,
+        prompt,
+      });
 
-    // --------------------------------------------------------
+    // ========================================================
     // TEXT
-    // --------------------------------------------------------
+    // ========================================================
 
     const modelText =
-      extractGeminiText(payload);
+      extractGeminiText(
+        payload
+      );
 
-    // --------------------------------------------------------
+    // ========================================================
     // JSON
-    // --------------------------------------------------------
+    // ========================================================
 
     const rawAction =
-      parseModelJSON(modelText);
+      parseModelJSON(
+        modelText
+      );
 
-    // --------------------------------------------------------
+    // ========================================================
     // NORMALIZE
-    // --------------------------------------------------------
+    // ========================================================
 
-    const action = normalizeAction(
-      rawAction,
-      info,
-      imageWidth,
-      imageHeight
-    );
+    const action =
+      normalizeAction(
+        rawAction,
+        info,
+        imageWidth,
+        imageHeight
+      );
 
-    // --------------------------------------------------------
+    // ========================================================
     // DIAGNOSIS
-    //
-    // Only useful in recovery mode.
-    // --------------------------------------------------------
+    // ========================================================
 
     const diagnosis =
       mode === "recover"
-        ? cleanText(rawAction?.diagnosis)
+        ? cleanText(
+            rawAction?.diagnosis
+          )
         : "";
 
-    // --------------------------------------------------------
-    // IMPORTANT:
-    // If normalizeAction detects invalid plan, return
-    // success=false instead of silently executing it.
-    // --------------------------------------------------------
+    // ========================================================
+    // INVALID ACTION
+    // ========================================================
 
-    if (action.action === "fail") {
+    if (
+      action.action ===
+      "fail"
+    ) {
       const reason =
         action.reason ||
         "Invalid AI action.";
 
-      return res.status(200).json({
-        success: false,
-        action: "fail",
-        reason,
-        diagnosis,
-        mode,
-        image_width: imageWidth,
-        image_height: imageHeight,
-        model,
-        version: VERSION,
-      });
+      return res
+        .status(200)
+        .json({
+          success: false,
+          action: "fail",
+          reason,
+          diagnosis,
+          mode,
+          image_width:
+            imageWidth,
+          image_height:
+            imageHeight,
+          model,
+          version: VERSION,
+        });
     }
 
-    // --------------------------------------------------------
+    // ========================================================
     // NORMAL RESPONSE
-    // --------------------------------------------------------
+    // ========================================================
 
-    return res.status(200).json({
-      success: true,
+    return res
+      .status(200)
+      .json({
+        success: true,
 
-      action: action.action,
+        action:
+          action.action,
 
-      // tap
-      ...(action.x !== undefined
-        ? { x: action.x }
-        : {}),
+        // ----------------------------------------------------
+        // PURPOSE
+        // ----------------------------------------------------
 
-      ...(action.y !== undefined
-        ? { y: action.y }
-        : {}),
+        ...(action.purpose
+          ? {
+              purpose:
+                action.purpose,
+            }
+          : {}),
 
-      // swipe
-      ...(action.x1 !== undefined
-        ? { x1: action.x1 }
-        : {}),
+        // ----------------------------------------------------
+        // TAP
+        // ----------------------------------------------------
 
-      ...(action.y1 !== undefined
-        ? { y1: action.y1 }
-        : {}),
+        ...(action.x !==
+        undefined
+          ? {
+              x: action.x,
+            }
+          : {}),
 
-      ...(action.x2 !== undefined
-        ? { x2: action.x2 }
-        : {}),
+        ...(action.y !==
+        undefined
+          ? {
+              y: action.y,
+            }
+          : {}),
 
-      ...(action.y2 !== undefined
-        ? { y2: action.y2 }
-        : {}),
+        // ----------------------------------------------------
+        // SWIPE
+        // ----------------------------------------------------
 
-      ...(action.duration !== undefined
-        ? { duration: action.duration }
-        : {}),
+        ...(action.x1 !==
+        undefined
+          ? {
+              x1: action.x1,
+            }
+          : {}),
 
-      // type
-      ...(action.text !== undefined
-        ? { text: action.text }
-        : {}),
+        ...(action.y1 !==
+        undefined
+          ? {
+              y1: action.y1,
+            }
+          : {}),
 
-      // wait
-      ...(action.seconds !== undefined
-        ? { seconds: action.seconds }
-        : {}),
+        ...(action.x2 !==
+        undefined
+          ? {
+              x2: action.x2,
+            }
+          : {}),
 
-      // wheel
-      ...(action.rows !== undefined
-        ? { rows: action.rows }
-        : {}),
+        ...(action.y2 !==
+        undefined
+          ? {
+              y2: action.y2,
+            }
+          : {}),
 
-      // plan
-      ...(Array.isArray(action.steps)
-        ? { steps: action.steps }
-        : {}),
+        ...(action.duration !==
+        undefined
+          ? {
+              duration:
+                action.duration,
+            }
+          : {}),
 
-      reason:
-        action.reason || "",
+        // ----------------------------------------------------
+        // TYPE
+        // ----------------------------------------------------
 
-      diagnosis,
+        ...(action.text !==
+        undefined
+          ? {
+              text:
+                action.text,
+            }
+          : {}),
 
-      mode,
+        // ----------------------------------------------------
+        // WAIT
+        // ----------------------------------------------------
 
-      image_width: imageWidth,
-      image_height: imageHeight,
+        ...(action.seconds !==
+        undefined
+          ? {
+              seconds:
+                action.seconds,
+            }
+          : {}),
 
-      model,
-      version: VERSION,
-    });
+        // ----------------------------------------------------
+        // WHEEL
+        // ----------------------------------------------------
+
+        ...(action.rows !==
+        undefined
+          ? {
+              rows:
+                action.rows,
+            }
+          : {}),
+
+        // ----------------------------------------------------
+        // PLAN
+        // ----------------------------------------------------
+
+        ...(Array.isArray(
+          action.steps
+        )
+          ? {
+              steps:
+                action.steps,
+            }
+          : {}),
+
+        // ----------------------------------------------------
+        // REASON
+        // ----------------------------------------------------
+
+        reason:
+          action.reason || "",
+
+        diagnosis,
+
+        mode,
+
+        image_width:
+          imageWidth,
+
+        image_height:
+          imageHeight,
+
+        model,
+
+        version: VERSION,
+      });
   } catch (error) {
-    // --------------------------------------------------------
+    // ========================================================
     // IMPORTANT:
-    // Do not let normal Gemini/API failures crash the Vercel
-    // function. Always return JSON to AutoTouch.
-    // --------------------------------------------------------
+    // Never let Gemini/API failure crash Vercel function.
+    // Always return JSON to AutoTouch.
+    // ========================================================
 
     const model =
       MODEL_ID;
 
     const message =
-      friendlyError(error, model);
+      friendlyError(
+        error,
+        model
+      );
 
     console.error(
       "[ANALYZE ERROR]",
@@ -1643,33 +2288,42 @@ export default async function handler(req, res) {
         error
     );
 
-    // Fatal configuration/API errors
-    if (isFatal(error)) {
-      return res.status(200).json({
-        success: false,
-        action: "fail",
+    // ========================================================
+    // FATAL CONFIGURATION/API ERROR
+    // ========================================================
+
+    if (
+      isFatal(error)
+    ) {
+      return res
+        .status(200)
+        .json({
+          success: false,
+          action: "fail",
+          reason: message,
+          error: message,
+          mode: "normal",
+          model,
+          version: VERSION,
+        });
+    }
+
+    // ========================================================
+    // TRANSIENT ERROR
+    //
+    // AutoTouch waits instead of crashing.
+    // ========================================================
+
+    return res
+      .status(200)
+      .json({
+        success: true,
+        action: "wait",
+        seconds: 3,
         reason: message,
-        error: message,
-        mode: "normal",
+        transient_error: true,
         model,
         version: VERSION,
       });
-    }
-
-    // --------------------------------------------------------
-    // TRANSIENT ERROR
-    //
-    // Tell AutoTouch to wait instead of crashing.
-    // --------------------------------------------------------
-
-    return res.status(200).json({
-      success: true,
-      action: "wait",
-      seconds: 3,
-      reason: message,
-      transient_error: true,
-      model,
-      version: VERSION,
-    });
   }
 }
