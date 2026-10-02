@@ -1,7 +1,8 @@
 // ============================================================
 // pages/api/analyze.js
 // AUTOTOUCH VISION AGENT
-// Gemini 3.5 Flash-Lite
+// GEMINI 3.5 FLASH-LITE
+// STABLE / SIMPLE VERSION
 // ============================================================
 
 export const config = {
@@ -12,8 +13,10 @@ export const config = {
   },
 };
 
+export const runtime = "nodejs";
+
 // ============================================================
-// MODEL - KHÓA CỨNG GEMINI 3.5
+// MODEL
 // ============================================================
 
 const MODEL_ID = "gemini-3.5-flash-lite";
@@ -22,23 +25,10 @@ const GEMINI_URL =
   `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_ID}:generateContent`;
 
 // ============================================================
-// ACTIONS
-// ============================================================
-
-const ACTIONS = [
-  "tap",
-  "swipe",
-  "type",
-  "wait",
-  "done",
-  "plan",
-];
-
-// ============================================================
 // HELPERS
 // ============================================================
 
-function safeString(value, fallback = "") {
+function str(value, fallback = "") {
   if (value === undefined || value === null) {
     return fallback;
   }
@@ -54,8 +44,8 @@ function safeString(value, fallback = "") {
   }
 }
 
-function trimText(value, max = 8000) {
-  const text = safeString(value);
+function limit(value, max = 8000) {
+  const text = str(value);
 
   if (text.length <= max) {
     return text;
@@ -64,41 +54,24 @@ function trimText(value, max = 8000) {
   return text.slice(0, max);
 }
 
-function safeJson(value, fallback = {}) {
-  if (value === undefined || value === null) {
-    return fallback;
-  }
-
-  if (typeof value === "object") {
-    return value;
-  }
-
-  try {
-    return JSON.parse(value);
-  } catch {
-    return fallback;
-  }
-}
-
 // ============================================================
 // IMAGE
 // ============================================================
 
 function normalizeImage(image) {
   if (!image) {
-    throw new Error("Missing image");
+    throw new Error("Thiếu image.");
   }
 
-  let value = String(image).trim();
+  const value = String(image).trim();
 
-  // Nếu gửi nguyên data URI
   if (value.startsWith("data:image/")) {
     const match = value.match(
       /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s
     );
 
     if (!match) {
-      throw new Error("Invalid image data URI");
+      throw new Error("Image data URI không hợp lệ.");
     }
 
     return {
@@ -107,7 +80,6 @@ function normalizeImage(image) {
     };
   }
 
-  // Nếu chỉ gửi base64
   return {
     mimeType: "image/png",
     data: value,
@@ -115,59 +87,34 @@ function normalizeImage(image) {
 }
 
 // ============================================================
-// CODE FENCE / JSON EXTRACTION
+// JSON PARSER
 // ============================================================
-
-function stripCodeFence(text) {
-  if (!text) {
-    return "";
-  }
-
-  let value = String(text).trim();
-
-  value = value.replace(/^```json\s*/i, "");
-  value = value.replace(/^```\s*/i, "");
-  value = value.replace(/\s*```$/i, "");
-
-  return value.trim();
-}
 
 function extractJson(text) {
   if (!text) {
     return null;
   }
 
-  let value = stripCodeFence(text);
+  let value = String(text).trim();
 
-  // Thử parse trực tiếp
+  // bỏ markdown fence
+  value = value
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  // parse trực tiếp
   try {
     return JSON.parse(value);
   } catch {}
 
-  // Tìm object JSON
-  const firstObject = value.indexOf("{");
-  const lastObject = value.lastIndexOf("}");
+  // tìm object
+  const first = value.indexOf("{");
+  const last = value.lastIndexOf("}");
 
-  if (firstObject !== -1 && lastObject > firstObject) {
-    const candidate = value.slice(
-      firstObject,
-      lastObject + 1
-    );
-
-    try {
-      return JSON.parse(candidate);
-    } catch {}
-  }
-
-  // Tìm array JSON
-  const firstArray = value.indexOf("[");
-  const lastArray = value.lastIndexOf("]");
-
-  if (firstArray !== -1 && lastArray > firstArray) {
-    const candidate = value.slice(
-      firstArray,
-      lastArray + 1
-    );
+  if (first !== -1 && last > first) {
+    const candidate = value.slice(first, last + 1);
 
     try {
       return JSON.parse(candidate);
@@ -181,11 +128,11 @@ function extractJson(text) {
 // NUMBER
 // ============================================================
 
-function numberOrNull(value) {
+function num(value, fallback = null) {
   const n = Number(value);
 
   if (!Number.isFinite(n)) {
-    return null;
+    return fallback;
   }
 
   return n;
@@ -199,37 +146,55 @@ function normalizeAction(raw) {
   if (!raw || typeof raw !== "object") {
     return {
       action: "wait",
-      reason: "Không nhận được action hợp lệ.",
+      ms: 1000,
+      reason: "Gemini không trả action hợp lệ.",
     };
   }
 
-  let action = safeString(raw.action).toLowerCase().trim();
+  let action = str(raw.action)
+    .toLowerCase()
+    .trim();
 
-  if (!ACTIONS.includes(action)) {
-    action = "wait";
+  const allowed = [
+    "tap",
+    "swipe",
+    "type",
+    "wait",
+    "done",
+    "plan",
+  ];
+
+  if (!allowed.includes(action)) {
+    return {
+      action: "wait",
+      ms: 1000,
+      reason: "Action không hợp lệ.",
+    };
   }
-
-  const result = {
-    action,
-  };
 
   // ----------------------------------------------------------
   // TAP
   // ----------------------------------------------------------
 
   if (action === "tap") {
-    const x = numberOrNull(raw.x);
-    const y = numberOrNull(raw.y);
+    const x = num(raw.x);
+    const y = num(raw.y);
 
     if (x === null || y === null) {
       return {
         action: "wait",
-        reason: "Tap không có tọa độ hợp lệ.",
+        ms: 1000,
+        reason: "Gemini trả tap nhưng thiếu tọa độ.",
       };
     }
 
-    result.x = Math.round(x);
-    result.y = Math.round(y);
+    return {
+      action: "tap",
+      x: Math.round(x),
+      y: Math.round(y),
+      reason: limit(raw.reason, 500),
+      target: limit(raw.target, 300),
+    };
   }
 
   // ----------------------------------------------------------
@@ -237,10 +202,10 @@ function normalizeAction(raw) {
   // ----------------------------------------------------------
 
   if (action === "swipe") {
-    const x1 = numberOrNull(raw.x1);
-    const y1 = numberOrNull(raw.y1);
-    const x2 = numberOrNull(raw.x2);
-    const y2 = numberOrNull(raw.y2);
+    const x1 = num(raw.x1);
+    const y1 = num(raw.y1);
+    const x2 = num(raw.x2);
+    const y2 = num(raw.y2);
 
     if (
       x1 === null ||
@@ -250,16 +215,26 @@ function normalizeAction(raw) {
     ) {
       return {
         action: "wait",
-        reason: "Swipe không có tọa độ hợp lệ.",
+        ms: 1000,
+        reason: "Gemini trả swipe nhưng thiếu tọa độ.",
       };
     }
 
-    result.x1 = Math.round(x1);
-    result.y1 = Math.round(y1);
-    result.x2 = Math.round(x2);
-    result.y2 = Math.round(y2);
-
-    result.duration = numberOrNull(raw.duration) || 400;
+    return {
+      action: "swipe",
+      x1: Math.round(x1),
+      y1: Math.round(y1),
+      x2: Math.round(x2),
+      y2: Math.round(y2),
+      duration: Math.max(
+        100,
+        Math.min(
+          3000,
+          Math.round(num(raw.duration, 400))
+        )
+      ),
+      reason: limit(raw.reason, 500),
+    };
   }
 
   // ----------------------------------------------------------
@@ -267,16 +242,22 @@ function normalizeAction(raw) {
   // ----------------------------------------------------------
 
   if (action === "type") {
-    const text = safeString(raw.text);
+    const text = str(raw.text);
 
     if (!text) {
       return {
         action: "wait",
-        reason: "Type không có text.",
+        ms: 1000,
+        reason: "Gemini trả type nhưng không có text.",
       };
     }
 
-    result.text = text;
+    return {
+      action: "type",
+      text,
+      reason: limit(raw.reason, 500),
+      target: limit(raw.target, 300),
+    };
   }
 
   // ----------------------------------------------------------
@@ -284,7 +265,19 @@ function normalizeAction(raw) {
   // ----------------------------------------------------------
 
   if (action === "wait") {
-    result.ms = numberOrNull(raw.ms) || 1000;
+    return {
+      action: "wait",
+      ms: Math.max(
+        300,
+        Math.min(
+          5000,
+          Math.round(num(raw.ms, 1000))
+        )
+      ),
+      reason:
+        limit(raw.reason, 500) ||
+        "Chờ UI ổn định.",
+    };
   }
 
   // ----------------------------------------------------------
@@ -292,9 +285,12 @@ function normalizeAction(raw) {
   // ----------------------------------------------------------
 
   if (action === "done") {
-    result.reason =
-      safeString(raw.reason) ||
-      "Đã hoàn thành.";
+    return {
+      action: "done",
+      reason:
+        limit(raw.reason, 500) ||
+        "Đã hoàn thành.",
+    };
   }
 
   // ----------------------------------------------------------
@@ -302,31 +298,44 @@ function normalizeAction(raw) {
   // ----------------------------------------------------------
 
   if (action === "plan") {
+    const steps = [];
+
     if (Array.isArray(raw.steps)) {
-      result.steps = raw.steps
-        .map(normalizePlanStep)
-        .filter(Boolean)
-        .slice(0, 8);
+      for (const step of raw.steps.slice(0, 5)) {
+        const normalized = normalizePlanStep(step);
+
+        if (normalized) {
+          steps.push(normalized);
+        }
+      }
     }
 
-    result.reason =
-      safeString(raw.reason) ||
-      "Thực hiện kế hoạch ngắn.";
+    if (steps.length === 0) {
+      return {
+        action: "wait",
+        ms: 1000,
+        reason: "Plan không có step hợp lệ.",
+      };
+    }
+
+    return {
+      action: "plan",
+      steps,
+      reason:
+        limit(raw.reason, 500) ||
+        "Thực hiện kế hoạch.",
+    };
   }
 
-  if (raw.reason) {
-    result.reason = trimText(raw.reason, 1000);
-  }
-
-  if (raw.target) {
-    result.target = trimText(raw.target, 500);
-  }
-
-  return result;
+  return {
+    action: "wait",
+    ms: 1000,
+    reason: "Fallback wait.",
+  };
 }
 
 // ============================================================
-// NORMALIZE PLAN STEP
+// PLAN STEP
 // ============================================================
 
 function normalizePlanStep(step) {
@@ -334,35 +343,30 @@ function normalizePlanStep(step) {
     return null;
   }
 
-  const action = safeString(step.action)
+  const action = str(step.action)
     .toLowerCase()
     .trim();
 
-  if (!ACTIONS.includes(action)) {
-    return null;
-  }
-
-  const output = {
-    action,
-  };
-
   if (action === "tap") {
-    const x = numberOrNull(step.x);
-    const y = numberOrNull(step.y);
+    const x = num(step.x);
+    const y = num(step.y);
 
     if (x === null || y === null) {
       return null;
     }
 
-    output.x = Math.round(x);
-    output.y = Math.round(y);
+    return {
+      action: "tap",
+      x: Math.round(x),
+      y: Math.round(y),
+    };
   }
 
   if (action === "swipe") {
-    const x1 = numberOrNull(step.x1);
-    const y1 = numberOrNull(step.y1);
-    const x2 = numberOrNull(step.x2);
-    const y2 = numberOrNull(step.y2);
+    const x1 = num(step.x1);
+    const y1 = num(step.y1);
+    const x2 = num(step.x2);
+    const y2 = num(step.y2);
 
     if (
       x1 === null ||
@@ -373,60 +377,67 @@ function normalizePlanStep(step) {
       return null;
     }
 
-    output.x1 = Math.round(x1);
-    output.y1 = Math.round(y1);
-    output.x2 = Math.round(x2);
-    output.y2 = Math.round(y2);
-    output.duration =
-      numberOrNull(step.duration) || 400;
+    return {
+      action: "swipe",
+      x1: Math.round(x1),
+      y1: Math.round(y1),
+      x2: Math.round(x2),
+      y2: Math.round(y2),
+      duration: Math.round(
+        num(step.duration, 400)
+      ),
+    };
   }
 
   if (action === "type") {
-    const text = safeString(step.text);
+    const text = str(step.text);
 
     if (!text) {
       return null;
     }
 
-    output.text = text;
+    return {
+      action: "type",
+      text,
+    };
   }
 
   if (action === "wait") {
-    output.ms =
-      numberOrNull(step.ms) || 1000;
+    return {
+      action: "wait",
+      ms: Math.round(
+        num(step.ms, 1000)
+      ),
+    };
   }
 
   if (action === "done") {
-    output.reason =
-      safeString(step.reason) ||
-      "Hoàn thành.";
+    return {
+      action: "done",
+      reason: limit(step.reason, 500),
+    };
   }
 
-  if (step.reason) {
-    output.reason =
-      trimText(step.reason, 500);
-  }
-
-  return output;
+  return null;
 }
 
 // ============================================================
 // INFO
 // ============================================================
 
-function buildInfo(info) {
+function formatInfo(info) {
   if (!info) {
-    return "Không có INFO được cung cấp.";
+    return "Không có INFO.";
   }
 
   if (typeof info === "string") {
-    return trimText(info, 5000);
+    return limit(info, 6000);
   }
 
   try {
-    return trimText(
+    return limit(
       JSON.stringify(info, null, 2),
-      5000
+      6000
     );
   } catch {
     return "Không thể đọc INFO.";
@@ -437,30 +448,453 @@ function buildInfo(info) {
 // HISTORY
 // ============================================================
 
-function buildHistory(history) {
+function formatHistory(history) {
   if (!history) {
-    return "Chưa có lịch sử action.";
+    return "Chưa có history.";
   }
 
   if (typeof history === "string") {
-    return trimText(history, 5000);
-  }
-
-  if (Array.isArray(history)) {
-    return trimText(
-      JSON.stringify(history, null, 2),
-      5000
-    );
+    return limit(history, 5000);
   }
 
   try {
-    return trimText(
+    return limit(
       JSON.stringify(history, null, 2),
       5000
     );
   } catch {
     return "Không thể đọc history.";
   }
+}
+
+// ============================================================
+// RULES
+// ============================================================
+
+function buildRules() {
+  return `
+============================================================
+QUY TẮC VISION AUTOTOUCH
+============================================================
+
+1. CHỈ NHÌN SCREENSHOT HIỆN TẠI
+- Chỉ thao tác với UI thực sự nhìn thấy.
+- Không bịa button.
+- Không bịa input.
+- Không bịa text.
+- Không bịa tọa độ.
+- Không đoán UI không nhìn thấy.
+
+2. MỖI LẦN CHỈ MỘT ACTION
+- Chọn action tiếp theo dựa trên screenshot hiện tại.
+- Sau tap/type/swipe phải chờ screenshot mới.
+- Không tự giả định UI đã thay đổi.
+
+3. KHÔNG CLICK MÙ
+- Không tap logo.
+- Không tap quảng cáo.
+- Không tap banner.
+- Không tap text trang trí.
+- Chỉ tap control có bằng chứng rõ ràng.
+
+============================================================
+TẠO TÀI KHOẢN / ĐĂNG KÝ
+============================================================
+
+Nếu mục tiêu là tạo tài khoản, tìm:
+
+"Tạo tài khoản"
+"Đăng ký"
+"Đăng kí"
+"Tạo tài khoản mới"
+"Create account"
+"Sign up"
+"Register"
+
+Nếu đang ở màn hình đăng nhập và thấy "Tạo tài khoản mới":
+
+→ ưu tiên tap "Tạo tài khoản mới".
+
+KHÔNG nhầm:
+
+"Đăng nhập"
+"Login"
+"Log in"
+"Sign in"
+
+với:
+
+"Đăng ký"
+"Sign up"
+"Register"
+"Tạo tài khoản"
+
+Nếu mục tiêu là đăng ký:
+- Không tap "Đăng nhập".
+- Không tap "Quên mật khẩu".
+- Không tap logo.
+
+============================================================
+HỌ TÊN
+============================================================
+
+Khi thấy:
+
+"Họ tên"
+"Họ và tên"
+"Full name"
+"Name"
+"Your name"
+
+Nếu INFO có họ tên:
+
+→ sử dụng đúng họ tên trong INFO.
+
+Nếu field trống:
+
+→ tap field
+→ type đúng họ tên.
+
+Nếu field đã chứa đúng họ tên:
+
+→ KHÔNG type lại.
+
+Không nhập:
+- số điện thoại
+- mật khẩu
+
+vào field Họ tên.
+
+Nếu có riêng:
+"Họ"
+"Tên"
+
+thì xử lý riêng từng field.
+
+============================================================
+NGÀY SINH
+============================================================
+
+Khi thấy:
+
+"Ngày sinh"
+"Sinh nhật"
+"Date of birth"
+"Birthday"
+"DOB"
+
+Nếu INFO có ngày sinh:
+
+→ dùng chính xác ngày sinh trong INFO.
+
+Không tự bịa ngày sinh.
+
+Nếu là input text:
+→ tap
+→ type đúng ngày sinh theo format UI.
+
+Nếu mở date picker:
+→ thao tác date picker.
+
+Nếu là wheel picker:
+→ xác định riêng Ngày / Tháng / Năm.
+
+Sau mỗi swipe wheel:
+→ phải chờ screenshot mới.
+
+Không swipe nhiều lần dựa trên phỏng đoán.
+
+Nếu có:
+"Hủy"
+"Cancel"
+"Xong"
+"Done"
+
+→ chỉ dùng "Xong/Done" sau khi ngày đúng.
+
+Không bấm "Hủy" nếu đang cần hoàn tất ngày sinh.
+
+============================================================
+SỐ ĐIỆN THOẠI
+============================================================
+
+Khi thấy:
+
+"Số điện thoại"
+"Điện thoại"
+"Phone"
+"Phone number"
+"Mobile"
+
+Nếu INFO có số điện thoại:
+
+→ sử dụng đúng số trong INFO.
+
+Nếu field đã chứa đúng số:
+
+→ KHÔNG type lại.
+
+Không nhập số điện thoại vào:
+- Họ tên
+- Ngày sinh
+- Mật khẩu
+
+Nếu có mã quốc gia:
+"+84"
+"+1"
+"+44"
+...
+
+→ xác định mã quốc gia từ screenshot.
+
+Không tự thay đổi mã quốc gia nếu không có bằng chứng.
+
+Không tự thêm/bớt số 0 nếu UI không yêu cầu.
+
+============================================================
+MẬT KHẨU
+============================================================
+
+Khi thấy:
+
+"Mật khẩu"
+"Password"
+"Create password"
+"New password"
+
+Nếu INFO có mật khẩu:
+
+→ dùng chính xác mật khẩu trong INFO.
+
+Không tự thay đổi mật khẩu.
+
+Nếu field đã có:
+"••••"
+"*****"
+hoặc ký hiệu ẩn:
+
+→ không thể biết nội dung thực tế chỉ từ screenshot.
+
+Không type lại nếu không có bằng chứng cần sửa.
+
+============================================================
+XÁC NHẬN MẬT KHẨU
+============================================================
+
+Khi thấy:
+
+"Xác nhận mật khẩu"
+"Nhập lại mật khẩu"
+"Confirm password"
+"Re-enter password"
+
+→ dùng đúng mật khẩu trong INFO.
+
+Không nhầm field này với field Mật khẩu chính.
+
+============================================================
+INPUT ĐÃ CÓ DỮ LIỆU
+============================================================
+
+Nếu field đã chứa đúng dữ liệu:
+
+→ không type lại.
+
+Không type lại chỉ vì field vẫn xuất hiện trên screenshot.
+
+Nếu dữ liệu khác:
+→ chỉ sửa khi có bằng chứng field cần sửa.
+
+============================================================
+LOADING / SPINNER
+============================================================
+
+Nếu button đang có spinner:
+
+→ KHÔNG click lại.
+
+Nếu UI đang loading:
+
+→ wait.
+
+Sau khi tap Đăng ký/Tạo tài khoản mà loading:
+
+→ wait.
+
+Không submit liên tục.
+
+============================================================
+BUTTON ĐĂNG KÝ
+============================================================
+
+Các button hợp lệ có thể là:
+
+"Đăng ký"
+"Tạo tài khoản"
+"Tạo tài khoản mới"
+"Create account"
+"Sign up"
+"Register"
+
+Chỉ tap khi:
+- button thực sự nhìn thấy
+- không disabled
+- không loading
+- các field bắt buộc đã được xử lý
+
+============================================================
+TIẾP TỤC
+============================================================
+
+Các button:
+
+"Tiếp tục"
+"Continue"
+"Next"
+"Tiếp theo"
+
+Chỉ tap khi các field bắt buộc của bước hiện tại đã hoàn tất.
+
+============================================================
+DISABLED
+============================================================
+
+Nếu button rõ ràng disabled:
+
+→ không tap.
+
+Nếu button chưa hoạt động vì thiếu field:
+
+→ xử lý field còn thiếu.
+
+============================================================
+VALIDATION
+============================================================
+
+Nếu sau action xuất hiện lỗi validation:
+
+Ví dụ:
+
+"Số điện thoại không hợp lệ"
+→ xử lý Số điện thoại.
+
+"Vui lòng nhập họ tên"
+→ xử lý Họ tên.
+
+"Mật khẩu không hợp lệ"
+→ xử lý Mật khẩu.
+
+Không lặp lại action cũ nếu UI chưa thay đổi.
+
+============================================================
+CAPTCHA / OTP
+============================================================
+
+Nếu xuất hiện:
+
+CAPTCHA
+OTP
+Mã xác minh
+Xác minh danh tính
+Challenge
+
+Không tự đoán.
+
+Nếu không có action chắc chắn:
+
+→ wait.
+
+============================================================
+SCROLL
+============================================================
+
+Chỉ scroll khi field/button mục tiêu không nhìn thấy.
+
+Sau scroll:
+→ chờ screenshot mới.
+
+Không scroll ngẫu nhiên.
+
+============================================================
+HISTORY
+============================================================
+
+Dùng history để tránh:
+- tap cùng button liên tục
+- type cùng dữ liệu nhiều lần
+- swipe lặp lại
+- thực hiện lại action đã hoàn thành
+
+Nhưng screenshot hiện tại luôn ưu tiên hơn history.
+
+============================================================
+KHI KHÔNG CHẮC CHẮN
+============================================================
+
+Không đoán.
+
+Không click ngẫu nhiên.
+
+Không type ngẫu nhiên.
+
+Không swipe ngẫu nhiên.
+
+→ ưu tiên wait.
+
+============================================================
+OUTPUT
+============================================================
+
+CHỈ TRẢ JSON.
+
+KHÔNG markdown.
+KHÔNG ```json.
+KHÔNG giải thích bên ngoài JSON.
+
+Ví dụ TAP:
+
+{
+  "action": "tap",
+  "x": 400,
+  "y": 1100,
+  "reason": "Đã xác định nút Tạo tài khoản mới."
+}
+
+Ví dụ TYPE:
+
+{
+  "action": "type",
+  "text": "Phạm Thu Hà",
+  "reason": "Field Họ tên đang trống."
+}
+
+Ví dụ WAIT:
+
+{
+  "action": "wait",
+  "ms": 1200,
+  "reason": "UI đang loading."
+}
+
+Ví dụ SWIPE:
+
+{
+  "action": "swipe",
+  "x1": 500,
+  "y1": 700,
+  "x2": 500,
+  "y2": 300,
+  "duration": 400,
+  "reason": "Cuộn để tìm field tiếp theo."
+}
+
+Ví dụ DONE:
+
+{
+  "action": "done",
+  "reason": "Đã hoàn thành flow."
+}
+`;
 }
 
 // ============================================================
@@ -474,529 +908,63 @@ function buildPrompt({
   history,
 }) {
   return `
-BẠN LÀ VISION AGENT ĐIỀU KHIỂN GIAO DIỆN MOBILE CHO AUTOTOUCH.
+BẠN LÀ VISION AGENT ĐIỀU KHIỂN UI MOBILE CHO AUTOTOUCH.
 
-Bạn chỉ được phân tích SCREENSHOT hiện tại và dữ liệu được cung cấp.
-Mỗi lần chỉ quyết định action tiếp theo an toàn và chắc chắn nhất.
-
-============================================================
-MỤC TIÊU
-============================================================
-
-${trimText(goal || "Hoàn thành màn hình đăng ký hiện tại và chuyển sang bước tiếp theo.", 3000)}
+Mục tiêu:
+${limit(
+  goal ||
+    "Hoàn thành màn hình đăng ký hiện tại và chuyển sang bước tiếp theo.",
+  3000
+)}
 
 ============================================================
-DỮ LIỆU INFO
+INFO
 ============================================================
 
-${buildInfo(info)}
+${formatInfo(info)}
 
 ============================================================
-LỊCH SỬ ACTION
+HISTORY
 ============================================================
 
-${buildHistory(history)}
+${formatHistory(history)}
 
 ============================================================
-RULES TỪ CLIENT
+RULES CLIENT
 ============================================================
 
-${trimText(rules || "", 8000)}
+${limit(rules || "", 7000)}
 
 ============================================================
-QUY TẮC CỐT LÕI
+RULES HỆ THỐNG
 ============================================================
 
-1. CHỈ DỰA TRÊN SCREENSHOT
-- Chỉ thao tác với UI thực sự nhìn thấy trên screenshot.
-- Không được tự bịa button, text, input, tọa độ hoặc trạng thái UI.
-- Không đoán một control tồn tại nếu screenshot không có đủ bằng chứng.
-
-2. MỖI VÒNG CHỈ MỘT ACTION
-- Bình thường chỉ trả về một action duy nhất.
-- Sau tap/type/swipe, client sẽ chụp screenshot mới.
-- Không giả định UI đã thay đổi nếu chưa nhìn thấy screenshot mới.
-
-3. KHÔNG CLICK MÙ
-- Không tap chỉ vì một button có màu nổi bật.
-- Phải xác định ý nghĩa button dựa trên text, vị trí, ngữ cảnh và mục tiêu.
-- Không tap logo, banner, quảng cáo hoặc text trang trí.
+${buildRules()}
 
 ============================================================
-LUỒNG TẠO TÀI KHOẢN / ĐĂNG KÝ
+YÊU CẦU CUỐI
 ============================================================
 
-- Nếu mục tiêu là đăng ký tài khoản, tìm các lựa chọn:
-  "Tạo tài khoản"
-  "Đăng ký"
-  "Đăng kí"
-  "Tạo tài khoản mới"
-  "Create account"
-  "Sign up"
-  "Register"
-
-- Nếu đang ở màn hình đăng nhập và thấy "Tạo tài khoản" hoặc "Đăng ký", ưu tiên tap lựa chọn đó.
-
-- KHÔNG nhầm:
-  "Đăng nhập"
-  "Login"
-  "Log in"
-  "Sign in"
-  với:
-  "Đăng ký"
-  "Sign up"
-  "Register"
-
-- Nếu mục tiêu là tạo tài khoản, không tap nút đăng nhập chỉ vì nó nổi bật hơn.
-
-- Khi đã vào màn hình đăng ký, xử lý lần lượt các trường bắt buộc đang nhìn thấy.
-
-- Nếu có:
-  "Tiếp tục"
-  "Continue"
-  "Next"
-  "Tiếp theo"
-  thì chỉ tap khi các trường bắt buộc của bước hiện tại đã được xử lý.
-
-- Nếu thấy:
-  "Tạo tài khoản"
-  "Đăng ký"
-  "Create account"
-  "Sign up"
-  "Register"
-  và đó rõ ràng là nút submit của form, chỉ tap khi các trường bắt buộc đã hoàn tất.
-
-============================================================
-DỮ LIỆU INFO
-============================================================
-
-- INFO là dữ liệu đầu vào đáng tin cậy để điền form.
-- Nếu INFO có Họ tên thì sử dụng đúng Họ tên.
-- Nếu INFO có Ngày sinh thì sử dụng đúng Ngày sinh.
-- Nếu INFO có Số điện thoại thì sử dụng đúng Số điện thoại.
-- Nếu INFO có Mật khẩu thì sử dụng đúng Mật khẩu.
-- Nếu INFO có dữ liệu xác nhận mật khẩu thì sử dụng đúng dữ liệu đó.
-- Không tự tạo dữ liệu thay thế khi INFO đã có giá trị.
-- Không tự bịa dữ liệu nếu INFO không cung cấp.
-- Chỉ sử dụng dữ liệu đúng với trường đang nhìn thấy.
-
-============================================================
-HỌ TÊN
-============================================================
-
-Nếu thấy:
-
-"Họ tên"
-"Họ và tên"
-"Full name"
-"Name"
-"Your name"
-
-và ngữ cảnh là form đăng ký:
-
-- Nếu INFO có Họ tên, sử dụng chính xác Họ tên trong INFO.
-- Nếu field đang trống:
-  1. tap field nếu cần
-  2. type Họ tên
-- Nếu field đã chứa đúng Họ tên:
-  không type lại.
-- Nếu field chứa dữ liệu khác:
-  chỉ sửa khi screenshot cho thấy field cần sửa.
-- Giữ nguyên thứ tự họ tên và khoảng trắng.
-- Không nhập số điện thoại hoặc mật khẩu vào field Họ tên.
-
-Nếu giao diện có hai field:
-
-"Họ"
-"Tên"
-
-thì phải xử lý riêng từng field.
-
-Không gộp toàn bộ họ tên vào một field nếu UI yêu cầu tách riêng.
-
-============================================================
-NGÀY SINH
-============================================================
-
-Nếu thấy:
-
-"Ngày sinh"
-"Sinh nhật"
-"Date of birth"
-"Birthday"
-"DOB"
-
-- Nếu INFO có ngày sinh, sử dụng chính xác ngày sinh đó.
-- Không tự đoán ngày sinh.
-- Không tự tạo ngày sinh nếu INFO không có.
-
-Nếu field là text input:
-- tap field
-- type ngày sinh đúng định dạng UI yêu cầu.
-
-Nếu field mở date picker:
-- không cố type vào vùng không nhận text.
-- thao tác với date picker đang hiển thị.
-
-Nếu là wheel picker:
-- xác định riêng:
-  Ngày
-  Tháng
-  Năm
-- Chỉ swipe bánh xe cần thay đổi.
-- Sau mỗi lần swipe phải chờ screenshot mới.
-- Không swipe liên tiếp dựa trên phỏng đoán.
-
-Nếu có:
-"Hủy"
-"Cancel"
-"Xong"
-"Done"
-
-- Không bấm Hủy nếu mục tiêu là hoàn thành ngày sinh.
-- Chỉ bấm Xong/Done khi ngày đã được đặt đúng.
-
-Nếu ngày sinh đã đúng:
-- không nhập lại.
-
-============================================================
-SỐ ĐIỆN THOẠI
-============================================================
-
-Nếu thấy:
-
-"Số điện thoại"
-"Điện thoại"
-"Phone"
-"Phone number"
-"Mobile"
-
-- Nếu INFO có số điện thoại, sử dụng đúng số trong INFO.
-- Không nhập số điện thoại vào field Họ tên, Ngày sinh hoặc Mật khẩu.
-- Nếu field đã có đúng số cần dùng, không type lại.
-- Nếu field có dữ liệu khác, chỉ sửa khi cần thiết.
-
-Nếu có mã quốc gia:
-
-"+84"
-"+1"
-"+44"
-...
-
-- Xác định mã quốc gia hiện tại từ screenshot.
-- Không tự thay đổi mã quốc gia nếu chưa có bằng chứng cần thay đổi.
-
-Không tự thêm/bớt số 0 nếu UI không yêu cầu.
-
-Nếu screenshot hoặc placeholder cho thấy format bắt buộc cụ thể thì tuân theo format đó.
-
-============================================================
-MẬT KHẨU
-============================================================
-
-Nếu thấy:
-
-"Mật khẩu"
-"Password"
-"Create password"
-"New password"
-
-- Nếu INFO có mật khẩu, sử dụng chính xác mật khẩu trong INFO.
-- Không tự thay đổi mật khẩu.
-- Không nhập mật khẩu vào field khác.
-
-Nếu field đang hiển thị:
-"*"
-"••••"
-"••••••"
-hoặc ký hiệu ẩn:
-
-- Không thể xác định nội dung thực tế chỉ từ screenshot.
-- Không tự kết luận mật khẩu đã đúng hoặc sai.
-- Nếu không có bằng chứng cần sửa thì không type lại.
-
-============================================================
-XÁC NHẬN MẬT KHẨU
-============================================================
-
-Nếu thấy:
-
-"Xác nhận mật khẩu"
-"Nhập lại mật khẩu"
-"Confirm password"
-"Re-enter password"
-
-- Dùng đúng mật khẩu trong INFO.
-- Không nhầm với field Mật khẩu chính.
-- Nếu cả hai field cùng xuất hiện, xử lý từng field đúng vị trí.
-
-============================================================
-INPUT ĐÃ CÓ DỮ LIỆU
-============================================================
-
-- Không type lại dữ liệu chỉ vì field vẫn xuất hiện trên screenshot.
-- Nếu field đã có đúng giá trị cần dùng thì bỏ qua field đó.
-- Nếu password bị che bằng dấu chấm thì không tự đoán nội dung.
-- Chỉ sửa field khi có bằng chứng field sai hoặc cần nhập dữ liệu khác.
-
-============================================================
-LOADING / SPINNER
-============================================================
-
-- Nếu button đang hiển thị spinner/loading indicator thay cho chữ, không coi spinner là text target.
-- Chỉ trả found=true cho button nếu có thể xác định rõ theo ngữ cảnh.
-- Không click lại một button đang loading.
-- Nếu toàn bộ UI đang loading, ưu tiên wait.
-- Nếu vừa submit và đang loading, không submit lần nữa.
-
-============================================================
-BUTTON ĐĂNG KÝ / TIẾP TỤC
-============================================================
-
-Khi đã hoàn tất các field bắt buộc:
-
-- Có thể tìm:
-  "Đăng ký"
-  "Tạo tài khoản"
-  "Create account"
-  "Sign up"
-  "Register"
-  "Tiếp tục"
-  "Continue"
-  "Next"
-  "Tiếp theo"
-
-- Chỉ tap button khi screenshot xác nhận đó là button thực sự.
-- Không tap nếu button bị disabled.
-- Không tap lại nếu button đang loading.
-
-============================================================
-BUTTON DISABLED
-============================================================
-
-Nếu button:
-
-- bị mờ rõ ràng
-- không thể tương tác
-- có trạng thái disabled rõ ràng
-
-thì không tap.
-
-Nếu button chưa hoạt động vì field chưa đủ dữ liệu:
-- xử lý field còn thiếu trước.
-
-============================================================
-VALIDATION ERROR
-============================================================
-
-Nếu sau khi submit xuất hiện lỗi:
-
-- đọc text lỗi trên screenshot.
-- xác định field liên quan.
-- sửa field đó nếu INFO cung cấp dữ liệu phù hợp.
-- không lặp lại cùng action nếu UI chưa thay đổi.
-
-Ví dụ:
-
-"Số điện thoại không hợp lệ"
-→ xử lý field số điện thoại.
-
-"Mật khẩu phải..."
-→ xử lý field mật khẩu nếu INFO có thể đáp ứng.
-
-"Vui lòng nhập họ tên"
-→ xử lý field Họ tên.
-
-============================================================
-CAPTCHA / OTP / XÁC MINH
-============================================================
-
-Nếu xuất hiện:
-
-- CAPTCHA
-- OTP
-- mã xác minh
-- xác minh danh tính
-- challenge
-- yêu cầu thao tác đặc biệt
-
-không được tự đoán.
-
-Nếu không có action chắc chắn từ screenshot:
-- wait.
-
-============================================================
-SCROLL
-============================================================
-
-Chỉ swipe/scroll khi:
-
-- field hoặc button mục tiêu không nhìn thấy.
-- Có bằng chứng nội dung còn nằm phía dưới/phía trên.
-- Scroll là cần thiết để tiếp tục flow.
-
-Không scroll ngẫu nhiên.
-
-Sau mỗi scroll:
-- chờ UI ổn định.
-- phân tích screenshot mới.
-
-============================================================
-DATE PICKER / WHEEL PICKER
-============================================================
-
-- Không đoán tọa độ.
-- Dựa trên screenshot hiện tại.
-- Nếu cần thay đổi wheel:
-  swipe đúng bánh xe.
-- Sau mỗi swipe phải chờ screenshot mới.
-- Không thực hiện nhiều swipe liên tục mà không kiểm tra kết quả.
-
-============================================================
-LỊCH SỬ ACTION
-============================================================
-
-History chỉ dùng để tránh:
-
-- tap cùng một button liên tục
-- nhập cùng một dữ liệu nhiều lần
-- swipe lặp lại không cần thiết
-- quay lại action cũ khi UI đã thay đổi
-
-Nhưng screenshot hiện tại luôn có quyền ưu tiên cao hơn history.
-
-============================================================
-SAU MỖI ACTION
-============================================================
-
-Sau:
-
-tap
-type
-swipe
-
-phải giả định UI có thể thay đổi.
-
-Không tự thực hiện action tiếp theo nếu chưa có screenshot mới.
-
-============================================================
-NGUYÊN TẮC AN TOÀN
-============================================================
+Hãy nhìn screenshot được gửi kèm.
+
+Xác định:
+1. Màn hình hiện tại.
+2. Field/button phù hợp với mục tiêu.
+3. Dữ liệu INFO nào cần sử dụng.
+4. Action tiếp theo duy nhất.
+
+Nếu chắc chắn:
+→ trả action.
 
 Nếu không chắc chắn:
+→ trả wait.
 
-- không đoán.
-- không click ngẫu nhiên.
-- không type ngẫu nhiên.
-- không swipe ngẫu nhiên.
-
-Ưu tiên:
-
-wait
-
-hoặc action có bằng chứng rõ ràng.
-
-============================================================
-OUTPUT
-============================================================
-
-CHỈ TRẢ VỀ JSON HỢP LỆ.
-
-Không markdown.
-Không ```json.
-Không giải thích bên ngoài JSON.
-
-Schema:
-
-{
-  "action": "tap|swipe|type|wait|done|plan",
-  "x": 0,
-  "y": 0,
-  "x1": 0,
-  "y1": 0,
-  "x2": 0,
-  "y2": 0,
-  "duration": 400,
-  "text": "",
-  "ms": 1000,
-  "reason": "",
-  "target": "",
-  "steps": []
-}
-
-============================================================
-QUY TẮC ACTION
-============================================================
-
-tap:
-{
-  "action": "tap",
-  "x": 123,
-  "y": 456,
-  "reason": "..."
-}
-
-swipe:
-{
-  "action": "swipe",
-  "x1": 500,
-  "y1": 700,
-  "x2": 500,
-  "y2": 300,
-  "duration": 400,
-  "reason": "..."
-}
-
-type:
-{
-  "action": "type",
-  "text": "Nguyễn Văn An",
-  "reason": "..."
-}
-
-wait:
-{
-  "action": "wait",
-  "ms": 1000,
-  "reason": "..."
-}
-
-done:
-{
-  "action": "done",
-  "reason": "..."
-}
-
-plan:
-{
-  "action": "plan",
-  "steps": [
-    {
-      "action": "tap",
-      "x": 100,
-      "y": 200
-    }
-  ],
-  "reason": "..."
-}
-
-============================================================
-ƯU TIÊN QUYẾT ĐỊNH
-============================================================
-
-1. Nhìn screenshot.
-2. Xác định màn hình hiện tại.
-3. Xác định mục tiêu hiện tại.
-4. Kiểm tra INFO.
-5. Kiểm tra field/button đã có dữ liệu hay chưa.
-6. Không lặp lại action đã hoàn thành.
-7. Chọn đúng một action tiếp theo.
-8. Chỉ trả JSON.
+CHỈ TRẢ JSON HỢP LỆ.
 `;
 }
 
 // ============================================================
-// GEMINI CALL
+// GEMINI
 // ============================================================
 
 async function callGemini({
@@ -1016,14 +984,14 @@ async function callGemini({
     history,
   });
 
-  const body = {
+  const requestBody = {
     systemInstruction: {
       parts: [
         {
           text:
-            "Bạn là Vision Agent điều khiển UI mobile. " +
-            "Hãy tuân thủ toàn bộ quy tắc tiếng Việt trong prompt. " +
-            "Chỉ trả JSON hợp lệ, không markdown, không giải thích ngoài JSON.",
+            "Bạn là Vision Agent mobile automation nghiêm ngặt. " +
+            "Tuân thủ rules tiếng Việt. " +
+            "Chỉ trả về một JSON action hợp lệ.",
         },
       ],
     },
@@ -1031,6 +999,7 @@ async function callGemini({
     contents: [
       {
         role: "user",
+
         parts: [
           {
             inlineData: {
@@ -1038,6 +1007,7 @@ async function callGemini({
               data: imageData.data,
             },
           },
+
           {
             text: prompt,
           },
@@ -1047,146 +1017,55 @@ async function callGemini({
 
     generationConfig: {
       temperature: 0,
+
+      // Không dùng responseSchema.
+      // Prompt sẽ ép Gemini trả JSON.
       responseMimeType: "application/json",
-
-      responseSchema: {
-        type: "OBJECT",
-
-        properties: {
-          action: {
-            type: "STRING",
-            enum: ACTIONS,
-          },
-
-          x: {
-            type: "NUMBER",
-          },
-
-          y: {
-            type: "NUMBER",
-          },
-
-          x1: {
-            type: "NUMBER",
-          },
-
-          y1: {
-            type: "NUMBER",
-          },
-
-          x2: {
-            type: "NUMBER",
-          },
-
-          y2: {
-            type: "NUMBER",
-          },
-
-          duration: {
-            type: "NUMBER",
-          },
-
-          text: {
-            type: "STRING",
-          },
-
-          ms: {
-            type: "NUMBER",
-          },
-
-          reason: {
-            type: "STRING",
-          },
-
-          target: {
-            type: "STRING",
-          },
-
-          steps: {
-            type: "ARRAY",
-            items: {
-              type: "OBJECT",
-
-              properties: {
-                action: {
-                  type: "STRING",
-                  enum: ACTIONS,
-                },
-
-                x: {
-                  type: "NUMBER",
-                },
-
-                y: {
-                  type: "NUMBER",
-                },
-
-                x1: {
-                  type: "NUMBER",
-                },
-
-                y1: {
-                  type: "NUMBER",
-                },
-
-                x2: {
-                  type: "NUMBER",
-                },
-
-                y2: {
-                  type: "NUMBER",
-                },
-
-                duration: {
-                  type: "NUMBER",
-                },
-
-                text: {
-                  type: "STRING",
-                },
-
-                ms: {
-                  type: "NUMBER",
-                },
-
-                reason: {
-                  type: "STRING",
-                },
-              },
-            },
-          },
-        },
-
-        required: [
-          "action",
-        ],
-      },
     },
   };
 
-  const response = await fetch(
-    GEMINI_URL,
-    {
-      method: "POST",
+  const controller =
+    new AbortController();
 
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key,
-      },
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 25000);
 
-      body: JSON.stringify(body),
-    }
-  );
+  let response;
 
-  const responseText = await response.text();
+  try {
+    response = await fetch(
+      GEMINI_URL,
+      {
+        method: "POST",
 
-  let data;
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": key,
+        },
+
+        body: JSON.stringify(requestBody),
+
+        signal: controller.signal,
+      }
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const responseText =
+    await response.text();
+
+  let data = null;
 
   try {
     data = JSON.parse(responseText);
   } catch {
     throw new Error(
-      `Gemini trả response không phải JSON: ${responseText.slice(0, 1000)}`
+      `Gemini trả response không phải JSON: ${responseText.slice(
+        0,
+        1000
+      )}`
     );
   }
 
@@ -1198,64 +1077,140 @@ async function callGemini({
     const error = new Error(message);
 
     error.status = response.status;
-    error.gemini = data;
 
     throw error;
   }
 
-  const text =
-    data?.candidates?.[0]?.content?.parts
-      ?.map((part) => part?.text || "")
-      .join("")
-      .trim();
+  const parts =
+    data?.candidates?.[0]?.content?.parts;
+
+  if (!Array.isArray(parts)) {
+    throw new Error(
+      "Gemini không trả content.parts."
+    );
+  }
+
+  const text = parts
+    .map((part) => part?.text || "")
+    .join("")
+    .trim();
 
   if (!text) {
     throw new Error(
-      "Gemini không trả về nội dung."
+      "Gemini trả content rỗng."
     );
   }
 
-  const parsed = extractJson(text);
+  const json = extractJson(text);
 
-  if (!parsed) {
+  if (!json) {
     throw new Error(
-      `Không parse được JSON từ Gemini: ${text.slice(0, 1500)}`
+      `Không parse được JSON Gemini: ${text.slice(
+        0,
+        1500
+      )}`
     );
   }
 
-  return parsed;
+  return json;
 }
 
 // ============================================================
-// ERROR MESSAGE
+// ERROR
 // ============================================================
 
-function errorMessage(error) {
-  const status = error?.status;
-
-  if (status === 401 || status === 403) {
-    return "Gemini API key không hợp lệ hoặc không có quyền sử dụng model.";
+function friendlyError(error) {
+  if (!error) {
+    return "Lỗi không xác định.";
   }
 
-  if (status === 429) {
-    return "Gemini API đang hết quota/rate limit.";
+  if (error.name === "AbortError") {
+    return "Gemini timeout.";
   }
 
-  if (status >= 500) {
-    return "Gemini server đang lỗi hoặc quá tải.";
+  if (error.status === 400) {
+    return `Gemini HTTP 400: ${error.message}`;
   }
 
-  return (
-    error?.message ||
+  if (error.status === 401) {
+    return "Gemini API key không hợp lệ.";
+  }
+
+  if (error.status === 403) {
+    return "Gemini API key không có quyền sử dụng model.";
+  }
+
+  if (error.status === 429) {
+    return "Gemini hết quota hoặc rate limit.";
+  }
+
+  if (error.status >= 500) {
+    return `Gemini server error ${error.status}.`;
+  }
+
+  return str(
+    error.message,
     "Lỗi không xác định."
   );
 }
 
 // ============================================================
-// API HANDLER
+// SAFE WAIT
 // ============================================================
 
-export default async function handler(req, res) {
+function waitResponse(reason) {
+  return {
+    ok: false,
+
+    model: MODEL_ID,
+
+    action: {
+      action: "wait",
+      ms: 1500,
+      reason: limit(reason, 1000),
+    },
+
+    server: "autotouch-vision",
+
+    version: "3.5-lite-safe-v2",
+  };
+}
+
+// ============================================================
+// HANDLER
+// ============================================================
+
+export default async function handler(
+  req,
+  res
+) {
+  // ----------------------------------------------------------
+  // CORS
+  // ----------------------------------------------------------
+
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "POST, OPTIONS"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type"
+  );
+
+  // ----------------------------------------------------------
+  // OPTIONS
+  // ----------------------------------------------------------
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+
   // ----------------------------------------------------------
   // METHOD
   // ----------------------------------------------------------
@@ -1263,64 +1218,75 @@ export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({
       ok: false,
-      error: "Method not allowed",
+      error: "Method not allowed.",
     });
   }
 
   // ----------------------------------------------------------
-  // BODY
-  // ----------------------------------------------------------
-
-  const body = req.body || {};
-
-  const image = body.image;
-  const key = body.key;
-
-  const goal =
-    body.goal ||
-    "Hoàn thành màn hình đăng ký hiện tại và chuyển sang bước tiếp theo.";
-
-  const info = body.info || "";
-
-  const rules = body.rules || "";
-
-  const history = body.history || [];
-
-  // ----------------------------------------------------------
-  // VALIDATION
-  // ----------------------------------------------------------
-
-  if (!image) {
-    return res.status(400).json({
-      ok: false,
-      error: "Thiếu image.",
-    });
-  }
-
-  if (!key) {
-    return res.status(400).json({
-      ok: false,
-      error: "Thiếu Gemini API key.",
-    });
-  }
-
-  // ----------------------------------------------------------
-  // CALL GEMINI
+  // EVERYTHING INSIDE TRY
   // ----------------------------------------------------------
 
   try {
-    const rawAction = await callGemini({
-      image,
-      key,
-      goal,
-      info,
-      rules,
-      history,
-    });
+    const body = req.body || {};
 
-    const action = normalizeAction(
-      rawAction
-    );
+    const image = body.image;
+    const key = body.key;
+
+    const goal =
+      body.goal ||
+      "Hoàn thành màn hình đăng ký hiện tại và chuyển sang bước tiếp theo.";
+
+    const info =
+      body.info || "";
+
+    const rules =
+      body.rules || "";
+
+    const history =
+      body.history || [];
+
+    // --------------------------------------------------------
+    // VALIDATION
+    // --------------------------------------------------------
+
+    if (!image) {
+      return res.status(400).json({
+        ok: false,
+        error: "Thiếu image.",
+      });
+    }
+
+    if (!key) {
+      return res.status(400).json({
+        ok: false,
+        error: "Thiếu Gemini API key.",
+      });
+    }
+
+    // --------------------------------------------------------
+    // GEMINI
+    // --------------------------------------------------------
+
+    const raw =
+      await callGemini({
+        image,
+        key,
+        goal,
+        info,
+        rules,
+        history,
+      });
+
+    // --------------------------------------------------------
+    // NORMALIZE
+    // --------------------------------------------------------
+
+    const action =
+      normalizeAction(raw);
+
+    // --------------------------------------------------------
+    // RESPONSE
+    // --------------------------------------------------------
 
     return res.status(200).json({
       ok: true,
@@ -1329,32 +1295,33 @@ export default async function handler(req, res) {
 
       action,
 
-      server: "autotouch-vision",
+      server:
+        "autotouch-vision",
 
-      version: "3.5-vn-registration-rules",
+      version:
+        "3.5-lite-safe-v2",
     });
+
   } catch (error) {
+    // ========================================================
+    // KHÔNG CHO FUNCTION CRASH
+    // ========================================================
+
+    const message =
+      friendlyError(error);
+
     console.error(
-      "Gemini analyze error:",
-      error
+      "[ANALYZE ERROR]",
+      message
     );
 
-    return res.status(200).json({
-      ok: false,
+    console.error(
+      "[ANALYZE ERROR STACK]",
+      error?.stack || ""
+    );
 
-      model: MODEL_ID,
-
-      action: {
-        action: "wait",
-        ms: 1500,
-        reason: errorMessage(error),
-      },
-
-      error: errorMessage(error),
-
-      server: "autotouch-vision",
-
-      version: "3.5-vn-registration-rules",
-    });
+    return res.status(200).json(
+      waitResponse(message)
+    );
   }
 }
