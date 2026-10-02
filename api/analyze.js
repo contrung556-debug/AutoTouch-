@@ -1,36 +1,29 @@
 // ============================================================
 // pages/api/analyze.js
-// AUTOTOUCH VISION AGENT - MERGED VERSION
+// AUTOTOUCH VISION AGENT
+// VERSION: 5.2-name-plan-fix
 //
-// Request:
-// {
-//   image,
-//   key,
-//   goal,
-//   info,
-//   rules[],
-//   history[],
-//   mode: "normal" | "recover",
-//   failure
-// }
+// Gemini:
+//   - Primary: gemini-3.5-flash-lite
+//   - Recovery: same model by default
 //
-// Response:
-// {
-//   success,
-//   action,
-//   reason,
-//   x, y,
-//   x2, y2,
-//   text,
-//   seconds,
-//   rows,
-//   steps,
-//   diagnosis,
-//   image_width,
-//   image_height,
-//   model,
-//   version
-// }
+// Supports:
+//   tap
+//   swipe
+//   type
+//   wait
+//   wheel
+//   plan
+//   launch
+//   restart
+//   done
+//   fail
+//
+// Important:
+//   - NAME SCREEN plan fixed
+//   - plan.steps[].action is the canonical format
+//   - type text must exist in INFO
+//   - no "Tiếp" inside name-entry plan
 // ============================================================
 
 export const config = {
@@ -47,184 +40,122 @@ export const config = {
 // ============================================================
 
 const MODEL_ID =
-  process.env.GEMINI_MODEL ||
-  "gemini-3.5-flash-lite";
+  process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
-const RECOVER_MODEL =
-  process.env.GEMINI_RECOVERY_MODEL ||
-  MODEL_ID;
+const RECOVERY_MODEL =
+  process.env.GEMINI_RECOVERY_MODEL || MODEL_ID;
 
-const VERSION =
-  "6.0-autotouch-merged";
+const VERSION = "5.2-name-plan-fix";
 
 const ATTEMPTS = 2;
 const TIMEOUT_MS = 22000;
 
-const MAX_PLAN_STEPS = 8;
+const MAX_PLAN_STEPS = 6;
 const MAX_WHEEL_ROWS = 40;
 
-const geminiUrl = (model) =>
-  `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+const GEMINI_BASE =
+  "https://generativelanguage.googleapis.com/v1beta/models";
+
+const ALLOWED_ACTIONS = [
+  "tap",
+  "swipe",
+  "type",
+  "wait",
+  "wheel",
+  "plan",
+  "launch",
+  "restart",
+  "done",
+  "fail",
+];
 
 // ============================================================
 // HELPERS
 // ============================================================
 
-function str(value, fallback = "") {
-  if (
-    value === undefined ||
-    value === null
-  ) {
-    return fallback;
-  }
+function str(v, fallback = "") {
+  return typeof v === "string" ? v : fallback;
+}
 
-  if (typeof value === "string") {
-    return value;
-  }
+function num(v, fallback = null) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
 
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function cleanText(v) {
+  return String(v ?? "")
+    .replace(/\u0000/g, "")
+    .trim();
+}
+
+function jsonSafe(v, fallback = null) {
   try {
-    return JSON.stringify(value);
+    return JSON.parse(JSON.stringify(v));
   } catch {
     return fallback;
   }
-}
-
-function limit(value, max = 8000) {
-  const text = str(value);
-
-  if (text.length <= max) {
-    return text;
-  }
-
-  return text.slice(0, max);
-}
-
-function num(value, fallback = null) {
-  if (
-    value === null ||
-    value === undefined ||
-    value === ""
-  ) {
-    return fallback;
-  }
-
-  const n = Number(value);
-
-  return Number.isFinite(n)
-    ? n
-    : fallback;
-}
-
-function clamp(
-  value,
-  min,
-  max,
-  fallback
-) {
-  const n = num(value, fallback);
-
-  return Math.max(
-    min,
-    Math.min(max, Math.round(n))
-  );
-}
-
-function sleep(ms) {
-  return new Promise((resolve) =>
-    setTimeout(resolve, ms)
-  );
-}
-
-function httpError(
-  message,
-  status
-) {
-  const err = new Error(message);
-  err.status = status;
-  return err;
-}
-
-function waitAction(
-  reason,
-  seconds = 2
-) {
-  return {
-    action: "wait",
-    seconds: clamp(
-      seconds,
-      1,
-      10,
-      2
-    ),
-    reason: limit(
-      reason,
-      500
-    ),
-  };
 }
 
 // ============================================================
 // IMAGE
 // ============================================================
 
-function normalizeImage(image) {
-  if (!image) {
-    throw httpError(
-      "Thiếu image.",
-      400
-    );
+function normalizeImage(input) {
+  if (!input || typeof input !== "string") {
+    throw new Error("IMAGE_MISSING");
   }
 
-  const value =
-    String(image).trim();
+  let s = input.trim();
 
-  if (
-    value.startsWith("data:")
-  ) {
-    const match =
-      value.match(
-        /^data:(image\/[a-zA-Z0-9.+-]+);base64,([\s\S]+)$/
-      );
+  // data:image/png;base64,...
+  if (s.startsWith("data:image/")) {
+    const comma = s.indexOf(",");
 
-    if (!match) {
-      throw httpError(
-        "Image data URI không hợp lệ.",
-        400
-      );
+    if (comma < 0) {
+      throw new Error("IMAGE_DATA_URI_INVALID");
+    }
+
+    const header = s.slice(0, comma);
+    const data = s.slice(comma + 1);
+
+    if (!data) {
+      throw new Error("IMAGE_DATA_EMPTY");
+    }
+
+    let mime = "image/png";
+
+    if (/image\/jpeg/i.test(header)) {
+      mime = "image/jpeg";
+    }
+
+    if (/image\/jpg/i.test(header)) {
+      mime = "image/jpeg";
+    }
+
+    if (/image\/webp/i.test(header)) {
+      mime = "image/webp";
     }
 
     return {
-      mimeType: match[1],
-      data:
-        match[2].replace(
-          /\s+/g,
-          ""
-        ),
+      mimeType: mime,
+      data: data.replace(/\s+/g, ""),
     };
   }
 
-  let mimeType =
-    "image/png";
+  // raw base64
+  s = s.replace(/\s+/g, "");
 
-  if (
-    value.startsWith("/9j/")
-  ) {
-    mimeType =
-      "image/jpeg";
-  } else if (
-    value.startsWith("UklGR")
-  ) {
-    mimeType =
-      "image/webp";
+  if (!s) {
+    throw new Error("IMAGE_DATA_EMPTY");
   }
 
   return {
-    mimeType,
-    data:
-      value.replace(
-        /\s+/g,
-        ""
-      ),
+    mimeType: "image/png",
+    data: s,
   };
 }
 
@@ -232,903 +163,822 @@ function normalizeImage(image) {
 // IMAGE SIZE
 // ============================================================
 
-function getImageSize(data) {
+function getImageSize(image) {
   try {
-    const head =
-      Buffer.from(
-        data.slice(0, 64),
-        "base64"
-      );
+    const buffer = Buffer.from(image.data, "base64");
 
     // PNG
     if (
-      head.length >= 24 &&
-      head[0] === 0x89 &&
-      head[1] === 0x50 &&
-      head[2] === 0x4e &&
-      head[3] === 0x47
+      buffer.length >= 24 &&
+      buffer[0] === 0x89 &&
+      buffer[1] === 0x50 &&
+      buffer[2] === 0x4e &&
+      buffer[3] === 0x47
     ) {
       return {
-        width:
-          head.readUInt32BE(16),
-
-        height:
-          head.readUInt32BE(20),
+        width: buffer.readUInt32BE(16),
+        height: buffer.readUInt32BE(20),
       };
     }
 
     // JPEG
     if (
-      head[0] === 0xff &&
-      head[1] === 0xd8
+      buffer.length >= 2 &&
+      buffer[0] === 0xff &&
+      buffer[1] === 0xd8
     ) {
-      const buf =
-        Buffer.from(
-          data,
-          "base64"
-        );
+      let offset = 2;
 
-      let i = 2;
-
-      while (
-        i + 9 <
-        buf.length
-      ) {
-        if (
-          buf[i] !== 0xff
-        ) {
-          i++;
+      while (offset + 9 < buffer.length) {
+        if (buffer[offset] !== 0xff) {
+          offset++;
           continue;
         }
 
-        const marker =
-          buf[i + 1];
+        const marker = buffer[offset + 1];
 
-        const isSof =
-          marker >= 0xc0 &&
-          marker <= 0xcf &&
-          ![
-            0xc4,
-            0xc8,
-            0xcc,
-          ].includes(marker);
+        // SOF markers
+        const isSOF =
+          marker === 0xc0 ||
+          marker === 0xc1 ||
+          marker === 0xc2 ||
+          marker === 0xc3 ||
+          marker === 0xc5 ||
+          marker === 0xc6 ||
+          marker === 0xc7 ||
+          marker === 0xc9 ||
+          marker === 0xca ||
+          marker === 0xcb ||
+          marker === 0xcd ||
+          marker === 0xce ||
+          marker === 0xcf;
 
-        if (isSof) {
+        if (isSOF) {
+          const height = buffer.readUInt16BE(offset + 5);
+          const width = buffer.readUInt16BE(offset + 7);
+
           return {
-            height:
-              buf.readUInt16BE(
-                i + 5
-              ),
-
-            width:
-              buf.readUInt16BE(
-                i + 7
-              ),
+            width,
+            height,
           };
         }
 
-        const length =
-          buf.readUInt16BE(
-            i + 2
-          );
+        if (offset + 4 > buffer.length) {
+          break;
+        }
 
-        i +=
-          2 + length;
+        const segmentLength = buffer.readUInt16BE(offset + 2);
+
+        if (!segmentLength || segmentLength < 2) {
+          break;
+        }
+
+        offset += 2 + segmentLength;
       }
     }
-  } catch {}
-
-  return null;
-}
-
-// ============================================================
-// JSON
-// ============================================================
-
-function extractJson(text) {
-  if (!text) {
-    return null;
-  }
-
-  const value =
-    String(text)
-      .trim()
-      .replace(
-        /^```(?:json)?\s*/i,
-        ""
-      )
-      .replace(
-        /\s*```$/i,
-        ""
-      )
-      .trim();
-
-  try {
-    return JSON.parse(value);
-  } catch {}
-
-  const first =
-    value.indexOf("{");
-
-  const last =
-    value.lastIndexOf("}");
-
-  if (
-    first !== -1 &&
-    last > first
-  ) {
-    try {
-      return JSON.parse(
-        value.slice(
-          first,
-          last + 1
-        )
-      );
-    } catch {}
-  }
-
-  return null;
-}
-
-// ============================================================
-// COORDINATES
-// ============================================================
-
-function norm(value) {
-  const n =
-    num(value);
-
-  if (n === null) {
-    return null;
-  }
-
-  return Math.max(
-    0,
-    Math.min(1000, n)
-  );
-}
-
-function toPx(
-  n,
-  size
-) {
-  return Math.max(
-    0,
-    Math.min(
-      size - 1,
-      Math.round(
-        (n / 1000) *
-          size
-      )
-    )
-  );
-}
-
-function point(
-  x,
-  y,
-  size
-) {
-  const nx =
-    norm(x);
-
-  const ny =
-    norm(y);
-
-  if (
-    nx === null ||
-    ny === null
-  ) {
-    return null;
+  } catch {
+    // ignore
   }
 
   return {
-    x: toPx(
-      nx,
-      size.width
-    ),
-
-    y: toPx(
-      ny,
-      size.height
-    ),
+    width: null,
+    height: null,
   };
 }
 
 // ============================================================
-// ALLOWED TYPE
+// COORDINATE NORMALIZATION
+//
+// Gemini is instructed to use 0..1000 coordinates.
+// AutoTouch/client receives actual screenshot pixels.
 // ============================================================
 
-function isAllowedText(
-  text,
-  info
-) {
+function normalizeXY(x, y, width, height) {
+  let nx = num(x);
+  let ny = num(y);
+
+  if (nx === null || ny === null) {
+    return {
+      x: null,
+      y: null,
+    };
+  }
+
+  // 0..1000 coordinate system
   if (
-    !text ||
-    !text.trim()
+    nx >= 0 &&
+    nx <= 1000 &&
+    ny >= 0 &&
+    ny <= 1000 &&
+    width &&
+    height
   ) {
+    nx = (nx / 1000) * width;
+    ny = (ny / 1000) * height;
+  }
+
+  if (width) {
+    nx = clamp(nx, 0, width - 1);
+  }
+
+  if (height) {
+    ny = clamp(ny, 0, height - 1);
+  }
+
+  return {
+    x: Math.round(nx),
+    y: Math.round(ny),
+  };
+}
+
+// ============================================================
+// TEXT VALIDATION
+// ============================================================
+
+function textAllowed(text, info) {
+  const t = cleanText(text);
+
+  if (!t) {
     return false;
   }
 
-  return str(info).includes(
-    text
-  );
+  const source = String(info || "");
+
+  if (!source) {
+    return false;
+  }
+
+  return source.includes(t);
 }
 
 // ============================================================
-// PLAN
+// NORMALIZE PLAN STEP
 // ============================================================
 
-function normalizePlanStep(
-  raw,
-  size,
-  info
-) {
-  if (
-    !raw ||
-    typeof raw !==
-      "object"
-  ) {
-    return {
-      skip: true,
-    };
+function normalizePlanStep(step, info, width, height) {
+  if (!step || typeof step !== "object") {
+    return null;
   }
 
-  const action =
-    str(raw.action)
-      .toLowerCase()
-      .trim();
+  // ----------------------------------------------------------
+  // IMPORTANT:
+  // canonical field is step.action
+  //
+  // We DO NOT accept:
+  // { type: "tap" }
+  //
+  // We accept:
+  // { action: "tap" }
+  // ----------------------------------------------------------
 
-  if (
-    action === "tap"
-  ) {
-    const p =
-      point(
-        raw.x,
-        raw.y,
-        size
-      );
+  const action = cleanText(step.action).toLowerCase();
 
-    if (!p) {
-      return {
-        skip: true,
-      };
-    }
-
-    return {
-      step: {
-        action: "tap",
-        x: p.x,
-        y: p.y,
-      },
-    };
+  if (!["tap", "type"].includes(action)) {
+    return null;
   }
 
-  if (
-    action === "type"
-  ) {
-    const text =
-      str(raw.text);
+  // ----------------------------------------------------------
+  // TAP
+  // ----------------------------------------------------------
+
+  if (action === "tap") {
+    const point = normalizeXY(
+      step.x,
+      step.y,
+      width,
+      height
+    );
 
     if (
-      !isAllowedText(
-        text,
-        info
-      )
+      point.x === null ||
+      point.y === null
+    ) {
+      return null;
+    }
+
+    return {
+      action: "tap",
+      x: point.x,
+      y: point.y,
+    };
+  }
+
+  // ----------------------------------------------------------
+  // TYPE
+  // ----------------------------------------------------------
+
+  if (action === "type") {
+    const text = cleanText(step.text);
+
+    if (!text) {
+      return null;
+    }
+
+    if (!textAllowed(text, info)) {
+      return null;
+    }
+
+    return {
+      action: "type",
+      text,
+    };
+  }
+
+  return null;
+}
+
+// ============================================================
+// NORMALIZE ACTION
+// ============================================================
+
+function normalizeAction(raw, info, width, height) {
+  if (!raw || typeof raw !== "object") {
+    return {
+      action: "fail",
+      reason: "AI returned an invalid action object.",
+    };
+  }
+
+  let action = cleanText(raw.action).toLowerCase();
+
+  // ----------------------------------------------------------
+  // Small compatibility layer.
+  //
+  // The model MUST still return "action", but this prevents
+  // harmless capitalization problems.
+  // ----------------------------------------------------------
+
+  if (!ALLOWED_ACTIONS.includes(action)) {
+    return {
+      action: "fail",
+      reason: `Unsupported action: ${action || "empty"}`,
+    };
+  }
+
+  // ==========================================================
+  // TAP
+  // ==========================================================
+
+  if (action === "tap") {
+    const point = normalizeXY(
+      raw.x,
+      raw.y,
+      width,
+      height
+    );
+
+    if (
+      point.x === null ||
+      point.y === null
     ) {
       return {
-        error:
-          `Text "${limit(
-            text,
-            40
-          )}" không nằm trong INFO.`,
+        action: "fail",
+        reason: "Tap coordinates are invalid.",
       };
     }
 
     return {
-      step: {
-        action: "type",
-        text,
-      },
+      action: "tap",
+      x: point.x,
+      y: point.y,
+      reason: str(raw.reason),
+    };
+  }
+
+  // ==========================================================
+  // SWIPE
+  // ==========================================================
+
+  if (action === "swipe") {
+    const from = normalizeXY(
+      raw.x1,
+      raw.y1,
+      width,
+      height
+    );
+
+    const to = normalizeXY(
+      raw.x2,
+      raw.y2,
+      width,
+      height
+    );
+
+    if (
+      from.x === null ||
+      from.y === null ||
+      to.x === null ||
+      to.y === null
+    ) {
+      return {
+        action: "fail",
+        reason: "Swipe coordinates are invalid.",
+      };
+    }
+
+    const duration = clamp(
+      num(raw.duration, 500),
+      100,
+      3000
+    );
+
+    return {
+      action: "swipe",
+      x1: from.x,
+      y1: from.y,
+      x2: to.x,
+      y2: to.y,
+      duration,
+      reason: str(raw.reason),
+    };
+  }
+
+  // ==========================================================
+  // TYPE
+  // ==========================================================
+
+  if (action === "type") {
+    const text = cleanText(raw.text);
+
+    if (!text) {
+      return {
+        action: "fail",
+        reason: "Type text is empty.",
+      };
+    }
+
+    if (!textAllowed(text, info)) {
+      return {
+        action: "fail",
+        reason:
+          "AI attempted to type text that does not exist in INFO.",
+      };
+    }
+
+    return {
+      action: "type",
+      text,
+      reason: str(raw.reason),
+    };
+  }
+
+  // ==========================================================
+  // WAIT
+  // ==========================================================
+
+  if (action === "wait") {
+    const seconds = clamp(
+      num(raw.seconds, 2),
+      1,
+      10
+    );
+
+    return {
+      action: "wait",
+      seconds,
+      reason: str(raw.reason),
+    };
+  }
+
+  // ==========================================================
+  // WHEEL
+  // ==========================================================
+
+  if (action === "wheel") {
+    const rows = num(raw.rows);
+
+    if (rows === null || rows === 0) {
+      return {
+        action: "fail",
+        reason: "Wheel rows are invalid.",
+      };
+    }
+
+    if (Math.abs(rows) > MAX_WHEEL_ROWS) {
+      return {
+        action: "fail",
+        reason:
+          `Wheel movement exceeds ${MAX_WHEEL_ROWS} rows.`,
+      };
+    }
+
+    const point = normalizeXY(
+      raw.x,
+      raw.y,
+      width,
+      height
+    );
+
+    if (
+      point.x === null ||
+      point.y === null
+    ) {
+      return {
+        action: "fail",
+        reason: "Wheel coordinates are invalid.",
+      };
+    }
+
+    return {
+      action: "wheel",
+      x: point.x,
+      y: point.y,
+      rows: Math.round(rows),
+      reason: str(raw.reason),
+    };
+  }
+
+  // ==========================================================
+  // PLAN
+  // ==========================================================
+
+  if (action === "plan") {
+    // --------------------------------------------------------
+    // The biggest fix:
+    //
+    // Gemini must return:
+    //
+    // {
+    //   "action": "plan",
+    //   "steps": [
+    //      {"action":"tap",...},
+    //      {"action":"type","text":"..."},
+    //      ...
+    //   ]
+    // }
+    //
+    // NOT:
+    //
+    // {"type":"tap"}
+    // --------------------------------------------------------
+
+    if (!Array.isArray(raw.steps)) {
+      return {
+        action: "fail",
+        reason: "Plan không hợp lệ: thiếu steps.",
+      };
+    }
+
+    if (raw.steps.length < 1) {
+      return {
+        action: "fail",
+        reason: "Plan không hợp lệ: steps rỗng.",
+      };
+    }
+
+    if (raw.steps.length > MAX_PLAN_STEPS) {
+      return {
+        action: "fail",
+        reason:
+          `Plan không hợp lệ: tối đa ${MAX_PLAN_STEPS} steps.`,
+      };
+    }
+
+    const steps = [];
+
+    for (const step of raw.steps) {
+      const normalized = normalizePlanStep(
+        step,
+        info,
+        width,
+        height
+      );
+
+      if (!normalized) {
+        return {
+          action: "fail",
+          reason:
+            "Plan không hợp lệ: mỗi step phải là action='tap' hoặc action='type', và type phải nằm trong INFO.",
+        };
+      }
+
+      steps.push(normalized);
+    }
+
+    // --------------------------------------------------------
+    // NAME SCREEN SAFETY
+    //
+    // Never allow "Tiếp" inside the same name-entry plan.
+    // We cannot reliably know the button coordinate, so the
+    // server enforces the plan structure only:
+    //
+    // tap Họ
+    // type Họ
+    // tap Tên
+    // type Tên
+    //
+    // A client screenshot after the plan decides next action.
+    // --------------------------------------------------------
+
+    const reason = str(raw.reason);
+
+    return {
+      action: "plan",
+      steps,
+      reason,
+    };
+  }
+
+  // ==========================================================
+  // LAUNCH
+  // ==========================================================
+
+  if (action === "launch") {
+    return {
+      action: "launch",
+      reason: str(raw.reason),
+    };
+  }
+
+  // ==========================================================
+  // RESTART
+  // ==========================================================
+
+  if (action === "restart") {
+    return {
+      action: "restart",
+      reason: str(raw.reason),
+    };
+  }
+
+  // ==========================================================
+  // DONE
+  // ==========================================================
+
+  if (action === "done") {
+    return {
+      action: "done",
+      reason: str(raw.reason),
+    };
+  }
+
+  // ==========================================================
+  // FAIL
+  // ==========================================================
+
+  if (action === "fail") {
+    return {
+      action: "fail",
+      reason:
+        str(raw.reason) ||
+        "AI reported failure.",
     };
   }
 
   return {
-    skip: true,
+    action: "fail",
+    reason: "Unknown action.",
   };
 }
-
-// ============================================================
-// ACTION NORMALIZATION
-// ============================================================
-
-function normalizeAction(
-  raw,
-  size,
-  info
-) {
-  if (
-    !raw ||
-    typeof raw !==
-      "object"
-  ) {
-    return waitAction(
-      "Gemini không trả action hợp lệ."
-    );
-  }
-
-  const action =
-    str(raw.action)
-      .toLowerCase()
-      .trim();
-
-  const reason =
-    limit(
-      raw.reason,
-      500
-    );
-
-  switch (
-    action
-  ) {
-    // --------------------------------------------------------
-    // TAP
-    // --------------------------------------------------------
-
-    case "tap": {
-      const p =
-        point(
-          raw.x,
-          raw.y,
-          size
-        );
-
-      if (!p) {
-        return waitAction(
-          "Gemini trả tap nhưng thiếu tọa độ."
-        );
-      }
-
-      return {
-        action: "tap",
-        x: p.x,
-        y: p.y,
-        target:
-          limit(
-            raw.target,
-            300
-          ),
-        reason,
-      };
-    }
-
-    // --------------------------------------------------------
-    // SWIPE
-    // --------------------------------------------------------
-
-    case "swipe": {
-      const a =
-        point(
-          raw.x,
-          raw.y,
-          size
-        );
-
-      const b =
-        point(
-          raw.x2,
-          raw.y2,
-          size
-        );
-
-      if (!a || !b) {
-        return waitAction(
-          "Gemini trả swipe nhưng thiếu tọa độ."
-        );
-      }
-
-      return {
-        action: "swipe",
-        x: a.x,
-        y: a.y,
-        x2: b.x,
-        y2: b.y,
-        reason,
-      };
-    }
-
-    // --------------------------------------------------------
-    // TYPE
-    // --------------------------------------------------------
-
-    case "type": {
-      const text =
-        str(raw.text);
-
-      if (!text) {
-        return waitAction(
-          "Gemini trả type nhưng không có text."
-        );
-      }
-
-      if (
-        !isAllowedText(
-          text,
-          info
-        )
-      ) {
-        return waitAction(
-          "Text không nằm trong INFO."
-        );
-      }
-
-      return {
-        action: "type",
-        text,
-        target:
-          limit(
-            raw.target,
-            300
-          ),
-        reason,
-      };
-    }
-
-    // --------------------------------------------------------
-    // WAIT
-    // --------------------------------------------------------
-
-    case "wait":
-      return {
-        action: "wait",
-
-        seconds:
-          clamp(
-            raw.seconds ??
-              (
-                num(
-                  raw.ms
-                )
-                  ? num(
-                      raw.ms
-                    ) / 1000
-                  : null
-              ),
-            1,
-            10,
-            2
-          ),
-
-        reason:
-          reason ||
-          "Chờ UI ổn định.",
-      };
-
-    // --------------------------------------------------------
-    // WHEEL
-    // --------------------------------------------------------
-
-    case "wheel": {
-      const p =
-        point(
-          raw.x,
-          raw.y,
-          size
-        );
-
-      if (!p) {
-        return waitAction(
-          "Gemini trả wheel nhưng thiếu tọa độ."
-        );
-      }
-
-      const rows =
-        clamp(
-          raw.rows,
-          -MAX_WHEEL_ROWS,
-          MAX_WHEEL_ROWS,
-          0
-        );
-
-      if (
-        rows === 0
-      ) {
-        return waitAction(
-          "Wheel rows = 0."
-        );
-      }
-
-      return {
-        action: "wheel",
-        x: p.x,
-        y: p.y,
-        rows,
-        reason,
-      };
-    }
-
-    // --------------------------------------------------------
-    // PLAN
-    // --------------------------------------------------------
-
-    case "plan": {
-      if (
-        !Array.isArray(
-          raw.steps
-        )
-      ) {
-        return waitAction(
-          "Plan không có steps."
-        );
-      }
-
-      const steps = [];
-
-      for (
-        const s of raw.steps.slice(
-          0,
-          MAX_PLAN_STEPS
-        )
-      ) {
-        const out =
-          normalizePlanStep(
-            s,
-            size,
-            info
-          );
-
-        if (
-          out.error
-        ) {
-          return waitAction(
-            out.error
-          );
-        }
-
-        if (
-          out.step
-        ) {
-          steps.push(
-            out.step
-          );
-        }
-      }
-
-      if (
-        steps.length === 0
-      ) {
-        return waitAction(
-          "Plan không có step hợp lệ."
-        );
-      }
-
-      return {
-        action: "plan",
-        steps,
-        reason:
-          reason ||
-          "Thực hiện plan.",
-      };
-    }
-
-    // --------------------------------------------------------
-    // LAUNCH
-    // --------------------------------------------------------
-
-    case "launch":
-      return {
-        action: "launch",
-
-        reason:
-          reason ||
-          "Mở lại ứng dụng.",
-      };
-
-    // --------------------------------------------------------
-    // RESTART
-    // --------------------------------------------------------
-
-    case "restart":
-      return {
-        action: "restart",
-
-        reason:
-          reason ||
-          "Đóng hẳn rồi mở lại ứng dụng.",
-      };
-
-    // --------------------------------------------------------
-    // DONE
-    // --------------------------------------------------------
-
-    case "done":
-      return {
-        action: "done",
-
-        reason:
-          reason ||
-          "Đã hoàn thành.",
-      };
-
-    // --------------------------------------------------------
-    // FAIL
-    // --------------------------------------------------------
-
-    case "fail":
-      return {
-        action: "fail",
-
-        reason:
-          reason ||
-          "AI không thể tiếp tục.",
-      };
-
-    default:
-      return waitAction(
-        "Action không hợp lệ."
-      );
-  }
-}
-
-// ============================================================
-// SYSTEM PROMPT
-// ============================================================
-
-const SYSTEM_PROMPT =
-  "Bạn là Vision Agent điều khiển UI điện thoại. " +
-  "Làm việc cực kỳ thận trọng theo screenshot hiện tại. " +
-  "Chỉ trả về MỘT JSON action hợp lệ. " +
-  "Không markdown. Không giải thích ngoài JSON.";
 
 // ============================================================
 // SYSTEM RULES
 // ============================================================
 
-const SYSTEM_RULES = `
-TỌA ĐỘ:
-- Gemini trả tọa độ chuẩn hóa 0..1000.
-- x=0 trái, x=1000 phải.
-- y=0 trên, y=1000 dưới.
-- Luôn chọn TÂM control.
+const SYSTEM_RULES = [
+  "You are a STRICT iOS Facebook signup vision controller.",
+  "You see exactly ONE current screenshot.",
+  "Never invent UI elements that are not visible.",
+  "Never invent text values.",
+  "Never invent phone numbers.",
+  "Never invent passwords.",
+  "Never use information that is not present in INFO.",
 
-NGUYÊN TẮC:
-- Chỉ dựa trên screenshot hiện tại.
-- Không bịa control.
-- Không đoán tọa độ.
-- Không chắc chắn thì WAIT.
-- Mỗi lần chỉ một action.
-- Sau mỗi action phải có screenshot mới.
-- Screenshot hiện tại quan trọng hơn history.
+  // ----------------------------------------------------------
+  // COORDINATES
+  // ----------------------------------------------------------
 
-QUẢNG CÁO:
-- Không tap quảng cáo.
-- Không tap banner.
-- Không tap link mở website/app ngoài.
-- Không thao tác nội dung ngoài mục tiêu.
+  "COORDINATES:",
+  "- Return x/y in a 0..1000 coordinate system.",
+  "- x=0 is left, x=1000 is right.",
+  "- y=0 is top, y=1000 is bottom.",
+  "- Tap the center of the actual visible control.",
+  "- Never tap based on a remembered coordinate from an old screenshot.",
 
-LOADING:
-- Spinner/loading -> wait.
-- Không click lại button đang loading.
-- Button disabled -> không tap.
+  // ----------------------------------------------------------
+  // LOADING
+  // ----------------------------------------------------------
 
-INPUT:
-- Chỉ type dữ liệu xuất hiện trong INFO.
-- Không type nhãn.
-- Không type dữ liệu tự suy luận.
-- Field đã đúng -> không type lại.
-- Không xóa dữ liệu đúng nếu không cần.
+  "LOADING / SPINNER:",
+  "- If a button displays a spinner/loading indicator instead of normal text, do NOT treat the spinner as the target text.",
+  "- Do not click a button that is visibly loading.",
+  "- If the UI is loading, return wait.",
+  "- Never repeat-click a loading button.",
+  "- Prefer wait 2-3 seconds.",
 
-PLAN:
-- Chỉ gồm tap/type.
-- Không swipe.
-- Không wheel.
-- Không wait.
-- Không đưa nút Tiếp vào plan.
-- Sau plan phải kiểm tra screenshot mới.
+  // ----------------------------------------------------------
+  // EXISTING INPUT
+  // ----------------------------------------------------------
 
-MẬT KHẨU:
-- Chỉ dùng Mật khẩu trong INFO.
-- Không tự tạo mật khẩu.
-- Nếu không có Mật khẩu -> fail.
-- Nếu ô đã có dấu chấm -> không type lại chỉ vì không thấy plaintext.
+  "INPUT ALREADY FILLED:",
+  "- If an input already contains the correct value, do not type it again.",
+  "- Masked password dots count as already entered if the password field visibly contains content.",
+  "- Do not clear a correct existing value.",
+  "- Do not append duplicate text.",
+  "- Only type into an empty or clearly incomplete field.",
 
-SỐ ĐIỆN THOẠI:
-- Chỉ dùng đúng Số di động trong INFO.
-- Không thêm +84.
-- Không bỏ số 0.
-- Không tự tạo số khác.
-- Nếu app báo số bị từ chối/đã dùng -> fail.
+  // ----------------------------------------------------------
+  // FACEBOOK WELCOME
+  // ----------------------------------------------------------
 
-NGÀY SINH:
-- INFO có ngày dạng DD/MM/YYYY.
-- Chỉ dùng wheel.
-- Không type ngày.
-- Không tap số trong wheel.
-- Thứ tự: năm -> tháng -> ngày.
-- Mỗi lần chỉ chỉnh một cột.
-- rows dương = giá trị phía dưới.
-- rows âm = giá trị phía trên.
-- Sau mỗi wheel phải xem screenshot mới.
-- Không chuyển cột khi cột hiện tại chưa xác nhận đúng.
-- Năm không quay vòng.
-- Tháng/ngày có thể quay vòng.
-- Không dùng rows > 40 trong một action.
+  "WELCOME SCREEN:",
+  "- If the visible screen has 'Tham gia Facebook' and a button 'Bắt đầu', tap 'Bắt đầu'.",
+  "- Never choose 'Tôi có trang cá nhân rồi' for this flow.",
 
-MÀN HÌNH ĐĂNG KÝ:
-- "Bắt đầu" -> tap Bắt đầu đúng ngữ cảnh đăng ký.
-- "Tạo tài khoản mới" -> tap.
-- "Tôi có trang cá nhân rồi" -> không tap.
-- "Tìm tài khoản của tôi" -> không tap.
-- "Đăng nhập" -> không tap khi đang đăng ký.
-- "Quên mật khẩu" -> không tap.
+  // ----------------------------------------------------------
+  // CREATE ACCOUNT
+  // ----------------------------------------------------------
 
-MÀN HÌNH TÊN:
-- Họ/Tên trống -> plan:
-  tap Họ -> type Họ -> tap Tên -> type Tên.
-- Sau plan kiểm tra lại rồi mới tap Tiếp.
+  "CREATE ACCOUNT SCREEN:",
+  "- If the screen says 'Tham gia Facebook' and shows 'Tạo tài khoản mới', tap 'Tạo tài khoản mới'.",
+  "- Never choose 'Tìm tài khoản của tôi'.",
+  "- Do not press back when the create-account option is visible.",
 
-MÀN HÌNH SỐ:
-- Ô trống -> plan tap + type số.
-- Sau plan kiểm tra lại.
-- Chỉ sau khi số đúng mới tap Tiếp.
+  // ----------------------------------------------------------
+  // LOGIN SCREEN
+  // ----------------------------------------------------------
 
-MÀN HÌNH MẬT KHẨU:
-- Ô trống -> plan tap + type mật khẩu.
-- Sau đó kiểm tra.
-- Không tap mắt.
-- Không tap checkbox ghi nhớ.
-- Chỉ tap Tiếp khi có bằng chứng dữ liệu đã được nhập.
+  "LOGIN SCREEN:",
+  "- If login fields are visible and 'Tạo tài khoản mới' is visible, tap 'Tạo tài khoản mới'.",
+  "- Do not enter credentials into the login screen.",
+  "- Do not press login.",
 
-APP BỊ ĐÓNG:
-- Nếu thấy màn hình chính iOS -> launch.
-- Không tap icon app trên Home Screen.
-- Nếu thấy trình chuyển đổi app -> launch.
-- Nếu thấy trang lỗi kỹ thuật -> restart.
-- Không tap nút Làm mới của trang lỗi.
+  // ----------------------------------------------------------
+  // META ACCOUNT
+  // ----------------------------------------------------------
 
-CAPTCHA / OTP / CHECKPOINT:
-- Không đoán.
-- Không tự nhập.
-- Có thể wait nếu rõ ràng đang loading.
-- Nếu bị chặn thực sự -> fail.
+  "META ACCOUNT SCREEN:",
+  "- If 'Bắt đầu trên Facebook bằng Tài khoản Meta' is visible with 'Bắt đầu', tap 'Bắt đầu'.",
 
-KẾT THÚC:
-- Nếu đã vào Facebook Feed/Home sau khi đăng ký -> done.
-- Nếu mục tiêu đã hoàn thành -> done.
-- Nếu không thể tiếp tục an toàn -> fail.
-`;
+  // ==========================================================
+  // NAME SCREEN - IMPORTANT FIX
+  // ==========================================================
+
+  "NAME SCREEN - BAN TEN GI:",
+  "- If the current screen has title 'Bạn tên gì?' and fields 'Họ' and 'Tên':",
+
+  "- If BOTH Họ and Tên are empty:",
+  "  + MUST return action='plan'.",
+  "  + The plan MUST contain tap Họ -> type Họ -> tap Tên -> type Tên.",
+  "  + Do NOT tap 'Tiếp' in this same plan.",
+  "  + Do NOT type both names into one field.",
+  "  + Use coordinates from the CURRENT screenshot.",
+  "  + Do not use hard-coded coordinates.",
+
+  "- If Họ is empty and Tên already contains the correct value:",
+  "  + Plan only Họ: tap Họ -> type Họ.",
+
+  "- If Tên is empty and Họ already contains the correct value:",
+  "  + Plan only Tên: tap Tên -> type Tên.",
+
+  "- If both Họ and Tên already contain the correct values:",
+  "  + Do not type them again.",
+  "  + The next screenshot may then allow tapping 'Tiếp'.",
+
+  "- The name-entry plan MUST NOT contain a tap on 'Tiếp'.",
+  "- After executing the name-entry plan, the client MUST capture a NEW screenshot before another action.",
+  "- Never tap keyboard suggestions.",
+  "- Never tap keyboard keys manually.",
+  "- Never tap the microphone, globe, spacebar, delete, or 'Xong' unless explicitly required by the UI flow.",
+
+  // ----------------------------------------------------------
+  // BIRTH DATE
+  // ----------------------------------------------------------
+
+  "BIRTH DATE:",
+  "- If a wheel date picker is visible, use wheel actions only.",
+  "- Target date comes from INFO in DD/MM/YYYY format.",
+  "- Adjust YEAR first, then MONTH, then DAY.",
+  "- Each wheel must be handled separately.",
+  "- After each wheel movement, the client must capture a new screenshot.",
+  "- Years increase downward.",
+  "- Month and day wheels wrap.",
+  "- Use the shortest direction for month/day when safe.",
+  "- Maximum wheel movement is 40 rows per action.",
+  "- Verify the displayed date before tapping 'Tiếp'.",
+  "- Do not swipe randomly on a wheel.",
+
+  // ----------------------------------------------------------
+  // PHONE
+  // ----------------------------------------------------------
+
+  "MOBILE NUMBER:",
+  "- Use only the exact allowed phone number from INFO.",
+  "- If phone field is empty, plan tap -> type exact phone.",
+  "- After entering phone, client must capture a new screenshot.",
+  "- Only then decide whether to tap 'Tiếp'.",
+  "- If Facebook reports invalid or already-used number, return fail.",
+  "- Never invent another phone number.",
+
+  // ----------------------------------------------------------
+  // PASSWORD
+  // ----------------------------------------------------------
+
+  "PASSWORD:",
+  "- Use only the exact allowed password from INFO.",
+  "- If password field is empty, plan tap -> type exact password.",
+  "- If masked dots are already visible, do not type again.",
+  "- Do not tap the remember-password checkbox.",
+  "- Do not tap the password eye icon.",
+  "- After entering password, client must capture a new screenshot.",
+
+  // ----------------------------------------------------------
+  // CAPTCHA / OTP
+  // ----------------------------------------------------------
+
+  "CAPTCHA / OTP / IDENTITY:",
+  "- If CAPTCHA, OTP, identity verification, suspicious login verification, or similar verification is visible, return wait.",
+  "- Do not attempt to solve verification automatically.",
+  "- If the same verification screen remains unchanged after 3 consecutive waits, return fail.",
+
+  // ----------------------------------------------------------
+  // APP OPEN / SPLASH
+  // ----------------------------------------------------------
+
+  "APP SPLASH:",
+  "- If Facebook or Meta logo splash screen is visible, return wait.",
+  "- Do not return launch while the splash is already visible.",
+  "- Wait approximately 3 seconds.",
+
+  // ----------------------------------------------------------
+  // HOME / APP SWITCHER
+  // ----------------------------------------------------------
+
+  "HOME SCREEN / APP SWITCHER:",
+  "- If the device is at iOS Home Screen or app switcher instead of Facebook, return launch.",
+  "- launch means the client should open Facebook again.",
+
+  // ----------------------------------------------------------
+  // APP ERROR
+  // ----------------------------------------------------------
+
+  "APP ERROR:",
+  "- If the page says 'Trang này hiện không hiển thị' or clearly indicates a technical Facebook page error, return restart.",
+  "- Do not simply tap 'Làm mới' for this type of technical error.",
+
+  // ----------------------------------------------------------
+  // DEVICE LOCK
+  // ----------------------------------------------------------
+
+  "DEVICE LOCK:",
+  "- If device passcode/lock screen is visible, return fail.",
+
+  // ----------------------------------------------------------
+  // REOPEN
+  // ----------------------------------------------------------
+
+  "REOPEN HISTORY:",
+  "- If history contains 'App vừa được mở lại', ignore old UI assumptions.",
+  "- Evaluate only the current screenshot.",
+
+  // ----------------------------------------------------------
+  // SUCCESS
+  // ----------------------------------------------------------
+
+  "SUCCESS:",
+  "- If Facebook feed/home has been reached and signup flow is complete, return done.",
+
+  // ----------------------------------------------------------
+  // REOPEN LIMIT
+  // ----------------------------------------------------------
+
+  "REOPEN LIMIT:",
+  "- If the app has been reopened 3 or more times and still does not reach the expected flow, return fail.",
+].join("\n");
 
 // ============================================================
-// HISTORY
+// RECOVERY BLOCK
 // ============================================================
 
-function formatHistory(
-  history
-) {
-  if (
-    !history ||
-    (
-      Array.isArray(history) &&
-      history.length === 0
-    )
-  ) {
-    return "Chưa có lịch sử.";
+function buildRecoveryBlock(failure) {
+  if (!failure || typeof failure !== "object") {
+    return "";
   }
 
-  if (
-    Array.isArray(history)
-  ) {
-    return limit(
-      history
-        .slice(-10)
-        .map(
-          (h) =>
-            str(h)
-        )
-        .join("\n"),
-      5000
-    );
-  }
-
-  return limit(
-    history,
-    5000
+  const reason = cleanText(failure.reason);
+  const previousAction = cleanText(
+    failure.previous_action
   );
-}
 
-function formatRules(
-  rules
-) {
-  if (
-    !rules ||
-    (
-      Array.isArray(rules) &&
-      rules.length === 0
-    )
-  ) {
-    return "Không có.";
+  if (!reason && !previousAction) {
+    return "";
   }
 
-  if (
-    Array.isArray(rules)
-  ) {
-    return limit(
-      rules
-        .map(
-          (r) =>
-            "- " +
-            str(r)
-        )
-        .join("\n"),
-      8000
-    );
-  }
-
-  return limit(
-    rules,
-    8000
-  );
-}
-
-// ============================================================
-// RECOVERY
-// ============================================================
-
-function buildRecoveryBlock(
-  failure
-) {
-  return `
-=== RECOVERY MODE ===
-
-Lần xử lý bình thường đã thất bại.
-
-LÝ DO:
-${limit(
-  failure,
-  1000
-)}
-
-Hãy phân tích screenshot hiện tại.
-
-ƯU TIÊN:
-
-1. Nếu mục tiêu đã đạt:
-   -> done
-
-2. Nếu đang ở Home Screen iOS:
-   -> launch
-
-3. Nếu đang ở ngoài app:
-   -> launch
-
-4. Nếu trang lỗi kỹ thuật:
-   -> restart
-
-5. Nếu UI đang loading:
-   -> wait
-
-6. Nếu action trước thất bại:
-   -> không lặp lại y nguyên action đó.
-   -> tìm vị trí khác của cùng control nếu screenshot có bằng chứng.
-   -> hoặc tap input trước rồi type.
-   -> hoặc swipe để tìm control.
-
-7. Nếu có mũi tên quay lại và đang ở sai bước:
-   -> có thể tap mũi tên quay lại.
-
-8. CAPTCHA / OTP / checkpoint:
-   -> fail nếu không thể tiếp tục tự động.
-
-9. Màn hình khóa/mật mã thiết bị:
-   -> fail.
-
-10. Không nhận diện được màn hình:
-   -> fail.
-   -> không đoán.
-
-Phải trả thêm:
-"diagnosis": mô tả tối đa 300 ký tự.
-`;
+  return [
+    "",
+    "RECOVERY MODE:",
+    "- The previous action failed.",
+    "- DO NOT blindly repeat the failed action.",
+    "- Diagnose the current screenshot first.",
+    "- If the screen changed, use the new screen state.",
+    "- If the target control is loading, return wait.",
+    "- If the app is outside Facebook, return launch.",
+    "- If a technical Facebook error page is visible, return restart.",
+    "- If the action is genuinely impossible, return fail.",
+    "",
+    `Previous action: ${previousAction || "unknown"}`,
+    `Failure reason: ${reason || "unknown"}`,
+  ].join("\n");
 }
 
 // ============================================================
@@ -1143,612 +993,683 @@ function buildPrompt({
   mode,
   failure,
 }) {
-  return `
-MỤC TIÊU:
-${limit(
-  goal,
-  3000
-)}
+  const clientRules = Array.isArray(rules)
+    ? rules
+        .filter(Boolean)
+        .map((x) => String(x))
+        .join("\n")
+    : "";
 
-=== INFO ===
-${limit(
-  str(info),
-  6000
-) || "Không có dữ liệu."}
+  const historyText = Array.isArray(history)
+    ? history
+        .slice(-20)
+        .map((x) => String(x))
+        .join("\n")
+    : "";
 
-=== HISTORY ===
-${formatHistory(
-  history
-)}
+  const recovery =
+    mode === "recover"
+      ? buildRecoveryBlock(failure)
+      : "";
 
-=== CLIENT RULES ===
-${formatRules(
-  rules
-)}
-
-=== SYSTEM RULES ===
-${SYSTEM_RULES}
-
-${
-  mode === "recover"
-    ? buildRecoveryBlock(
-        failure
-      )
-    : ""
-}
-
-Hãy quan sát screenshot.
-
-Xác định:
-- màn hình hiện tại
-- control phù hợp
-- dữ liệu cần dùng
-- trạng thái loading
-- trạng thái field
-- action trước đó có hiệu quả hay không
-
-Sau đó chỉ trả MỘT action tiếp theo.
-
-Không chắc chắn:
--> wait trong normal mode nếu UI đang chuyển/loading.
--> fail trong recovery mode nếu không nhận diện được.
-
-CHỈ TRẢ JSON.
-`;
+  return [
+    "CURRENT TASK:",
+    cleanText(goal) || "Complete the current signup flow.",
+    "",
+    "INFO:",
+    String(info || ""),
+    "",
+    "CLIENT RULES:",
+    clientRules || "(none)",
+    "",
+    "HISTORY:",
+    historyText || "(none)",
+    "",
+    SYSTEM_RULES,
+    recovery,
+    "",
+    "OUTPUT REQUIREMENTS:",
+    "- Return ONE JSON object only.",
+    "- No markdown.",
+    "- No explanation outside JSON.",
+    "- action must be one of: tap, swipe, type, wait, wheel, plan, launch, restart, done, fail.",
+    "",
+    "FOR PLAN:",
+    "- plan.steps must be an array.",
+    "- Every step MUST use field 'action'.",
+    "- Valid step action values are ONLY 'tap' and 'type'.",
+    "- Tap step: {action:'tap', x:number, y:number}.",
+    "- Type step: {action:'type', text:string}.",
+    "- Do not use step.type as the action field.",
+    "- Do not put 'Tiếp' inside the name-entry plan.",
+    "",
+    "JSON SHAPES:",
+    "",
+    '{"action":"tap","x":500,"y":500,"reason":"..."}',
+    "",
+    '{"action":"type","text":"Phạm","reason":"..."}',
+    "",
+    '{"action":"wait","seconds":3,"reason":"..."}',
+    "",
+    '{"action":"wheel","x":500,"y":500,"rows":3,"reason":"..."}',
+    "",
+    '{"action":"plan","steps":[' +
+      '{"action":"tap","x":250,"y":450},' +
+      '{"action":"type","text":"Phạm"},' +
+      '{"action":"tap","x":750,"y":450},' +
+      '{"action":"type","text":"Thu Hà"}' +
+      '],"reason":"Nhập Họ và Tên"}',
+    "",
+    '{"action":"launch","reason":"..."}',
+    "",
+    '{"action":"restart","reason":"..."}',
+    "",
+    '{"action":"done","reason":"..."}',
+    "",
+    '{"action":"fail","reason":"..."}',
+  ].join("\n");
 }
 
 // ============================================================
-// GEMINI
+// GEMINI REQUEST
 // ============================================================
 
 async function callGemini({
-  imageData,
+  model,
   key,
-  goal,
-  info,
-  rules,
-  history,
-  mode,
-  failure,
+  image,
+  prompt,
 }) {
-  const requestBody = {
-    systemInstruction: {
-      parts: [
-        {
-          text:
-            SYSTEM_PROMPT,
-        },
-      ],
-    },
+  const controller = new AbortController();
 
-    contents: [
-      {
-        role: "user",
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, TIMEOUT_MS);
 
+  try {
+    const url =
+      `${GEMINI_BASE}/${encodeURIComponent(model)}` +
+      `:generateContent?key=${encodeURIComponent(key)}`;
+
+    const body = {
+      systemInstruction: {
         parts: [
           {
-            inlineData: {
-              mimeType:
-                imageData.mimeType,
-
-              data:
-                imageData.data,
-            },
-          },
-
-          {
             text:
-              buildPrompt({
-                goal,
-                info,
-                rules,
-                history,
-                mode,
-                failure,
-              }),
+              "Return strict JSON only. " +
+              "You are a vision controller. " +
+              "Follow the system rules exactly.",
           },
         ],
       },
-    ],
 
-    generationConfig: {
-      temperature: 0,
-      maxOutputTokens: 1024,
-      responseMimeType:
-        "application/json",
-    },
-  };
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              inlineData: {
+                mimeType: image.mimeType,
+                data: image.data,
+              },
+            },
+            {
+              text: prompt,
+            },
+          ],
+        },
+      ],
 
-  const payload =
-    JSON.stringify(
-      requestBody
-    );
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: 1024,
+        responseMimeType: "application/json",
+      },
+    };
 
-  let response = null;
-  let responseText = "";
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
 
-  for (
-    let attempt = 1;
-    attempt <= ATTEMPTS;
-    attempt++
-  ) {
-    const controller =
-      new AbortController();
-
-    const timer =
-      setTimeout(
-        () =>
-          controller.abort(),
-        TIMEOUT_MS
-      );
+    let payload = null;
 
     try {
-      response =
-        await fetch(
-          geminiUrl(
-            mode === "recover"
-              ? RECOVER_MODEL
-              : MODEL_ID
-          ),
-          {
-            method: "POST",
-
-            headers: {
-              "Content-Type":
-                "application/json",
-
-              "x-goog-api-key":
-                key,
-            },
-
-            body: payload,
-
-            signal:
-              controller.signal,
-          }
-        );
-
-      responseText =
-        await response.text();
-    } catch (err) {
-      if (
-        attempt ===
-        ATTEMPTS
-      ) {
-        throw err;
-      }
-
-      console.error(
-        "[GEMINI NETWORK]",
-        attempt,
-        err?.message
-      );
-
-      await sleep(
-        500 * attempt
-      );
-
-      continue;
-    } finally {
-      clearTimeout(
-        timer
-      );
+      payload = await response.json();
+    } catch {
+      payload = null;
     }
 
-    if (
-      response.ok
-    ) {
-      break;
-    }
-
-    console.error(
-      `[GEMINI ${response.status}]`,
-      responseText.slice(
-        0,
-        1000
-      )
-    );
-
-    const retryable =
-      response.status ===
-        429 ||
-      response.status >=
-        500;
-
-    if (
-      !retryable ||
-      attempt ===
-        ATTEMPTS
-    ) {
-      break;
-    }
-
-    await sleep(
-      600 * attempt
-    );
-  }
-
-  let data = null;
-
-  try {
-    data =
-      JSON.parse(
-        responseText
+    if (!response.ok) {
+      const error = new Error(
+        payload?.error?.message ||
+          `Gemini HTTP ${response.status}`
       );
-  } catch {
-    throw httpError(
-      "Gemini trả response không phải JSON: " +
-        responseText.slice(
-          0,
-          300
-        ),
-      response?.status ||
-        502
-    );
+
+      error.status = response.status;
+      error.payload = payload;
+
+      throw error;
+    }
+
+    return payload;
+  } finally {
+    clearTimeout(timeout);
   }
+}
 
-  if (
-    !response.ok
-  ) {
-    throw httpError(
-      data?.error?.message ||
-        `Gemini HTTP ${response.status}`,
-      response.status
-    );
-  }
+// ============================================================
+// EXTRACT GEMINI TEXT
+// ============================================================
 
-  const candidate =
-    data?.candidates?.[0];
-
-  const parts =
-    candidate?.content?.parts;
-
-  if (
-    !Array.isArray(parts)
-  ) {
-    const why =
-      data?.promptFeedback
-        ?.blockReason ||
-      candidate?.finishReason ||
-      "không rõ";
-
-    throw httpError(
-      `Gemini không trả content: ${why}`,
-      502
-    );
-  }
-
+function extractGeminiText(payload) {
   const text =
-    parts
-      .map(
-        (p) =>
-          p?.text || ""
-      )
+    payload?.candidates?.[0]?.content?.parts
+      ?.map((p) => p?.text || "")
       .join("")
       .trim();
 
   if (!text) {
-    throw httpError(
-      "Gemini trả content rỗng.",
-      502
-    );
+    throw new Error("GEMINI_EMPTY_RESPONSE");
   }
 
-  const json =
-    extractJson(text);
-
-  if (!json) {
-    throw httpError(
-      "Không parse được JSON Gemini: " +
-        text.slice(
-          0,
-          500
-        ),
-      502
-    );
-  }
-
-  return Array.isArray(
-    json
-  )
-    ? json[0]
-    : json;
+  return text;
 }
 
 // ============================================================
-// ERROR
+// PARSE JSON
 // ============================================================
 
-function friendlyError(
-  error
-) {
-  if (!error) {
-    return "Lỗi không xác định.";
+function parseModelJSON(text) {
+  let source = String(text || "").trim();
+
+  // Remove accidental markdown fences
+  source = source
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  try {
+    return JSON.parse(source);
+  } catch {
+    // Try extracting first JSON object
+    const start = source.indexOf("{");
+    const end = source.lastIndexOf("}");
+
+    if (start >= 0 && end > start) {
+      const candidate = source.slice(
+        start,
+        end + 1
+      );
+
+      try {
+        return JSON.parse(candidate);
+      } catch {
+        // continue
+      }
+    }
   }
 
-  if (
-    error.name ===
-    "AbortError"
-  ) {
+  throw new Error("GEMINI_INVALID_JSON");
+}
+
+// ============================================================
+// RETRY
+// ============================================================
+
+function shouldRetry(status) {
+  return (
+    status === 429 ||
+    status >= 500
+  );
+}
+
+async function askGemini({
+  model,
+  key,
+  image,
+  prompt,
+}) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
+    try {
+      return await callGemini({
+        model,
+        key,
+        image,
+        prompt,
+      });
+    } catch (error) {
+      lastError = error;
+
+      const status = Number(error?.status || 0);
+
+      if (
+        attempt >= ATTEMPTS ||
+        !shouldRetry(status)
+      ) {
+        throw error;
+      }
+
+      await new Promise((resolve) =>
+        setTimeout(resolve, 600 * attempt)
+      );
+    }
+  }
+
+  throw lastError || new Error("GEMINI_FAILED");
+}
+
+// ============================================================
+// FRIENDLY ERRORS
+// ============================================================
+
+function friendlyError(error, model) {
+  const status = Number(error?.status || 0);
+
+  if (error?.name === "AbortError") {
     return "Gemini timeout.";
   }
 
-  switch (true) {
-    case error.status === 400:
-      return (
-        "Yêu cầu không hợp lệ: " +
-        error.message
-      );
-
-    case error.status === 401:
-      return "Gemini API key không hợp lệ.";
-
-    case error.status === 403:
-      return "Gemini API key không có quyền dùng model.";
-
-    case error.status === 404:
-      return (
-        `Model "${MODEL_ID}" không tồn tại hoặc không hỗ trợ.`
-      );
-
-    case error.status === 429:
-      return "Gemini hết quota hoặc bị rate limit.";
-
-    case error.status >= 500:
-      return (
-        `Gemini server error ${error.status}.`
-      );
-
-    default:
-      return str(
-        error.message,
-        "Lỗi không xác định."
-      );
+  if (status === 400) {
+    return (
+      error?.message ||
+      "Gemini request không hợp lệ."
+    );
   }
+
+  if (status === 401) {
+    return "Gemini API key không hợp lệ.";
+  }
+
+  if (status === 403) {
+    return "Gemini API key không có quyền sử dụng model.";
+  }
+
+  if (status === 404) {
+    return `Không tìm thấy Gemini model: ${model}`;
+  }
+
+  if (status === 429) {
+    return "Gemini quota/rate limit.";
+  }
+
+  if (status >= 500) {
+    return "Gemini server error.";
+  }
+
+  return (
+    error?.message ||
+    "Unknown Gemini error."
+  );
 }
 
-function isFatal(
-  error
-) {
-  return [
-    400,
-    401,
-    403,
-    404,
-  ].includes(
-    error?.status
+function isFatal(error) {
+  const status = Number(error?.status || 0);
+
+  return (
+    status === 400 ||
+    status === 401 ||
+    status === 403 ||
+    status === 404
   );
 }
 
 // ============================================================
-// HANDLER
+// CORS
 // ============================================================
 
-export default async function handler(
-  req,
-  res
-) {
+function setCors(res) {
+  res.setHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "POST, OPTIONS"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization"
+  );
+
+  res.setHeader(
+    "Cache-Control",
+    "no-store, max-age=0"
+  );
+}
+
+// ============================================================
+// MAIN HANDLER
+// ============================================================
+
+export default async function handler(req, res) {
+  setCors(res);
+
+  // ----------------------------------------------------------
+  // OPTIONS
+  // ----------------------------------------------------------
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  // ----------------------------------------------------------
+  // METHOD
+  // ----------------------------------------------------------
+
+  if (req.method !== "POST") {
+    return res.status(405).json({
+      success: false,
+      error: "Method not allowed.",
+      version: VERSION,
+    });
+  }
+
   try {
-    res.setHeader(
-      "Access-Control-Allow-Origin",
-      "*"
-    );
+    const body =
+      req.body &&
+      typeof req.body === "object"
+        ? req.body
+        : {};
 
-    res.setHeader(
-      "Access-Control-Allow-Methods",
-      "POST, OPTIONS"
-    );
-
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type"
-    );
-
-    if (
-      req.method ===
-      "OPTIONS"
-    ) {
-      return res
-        .status(200)
-        .end();
-    }
-
-    if (
-      req.method !==
-      "POST"
-    ) {
-      return res
-        .status(405)
-        .json({
-          success: false,
-          error:
-            "Method not allowed.",
-        });
-    }
-
-    let body =
-      req.body;
-
-    if (
-      typeof body ===
-      "string"
-    ) {
-      try {
-        body =
-          JSON.parse(
-            body
-          );
-      } catch {
-        body = {};
-      }
-    }
-
-    body =
-      body || {};
+    // --------------------------------------------------------
+    // API KEY
+    //
+    // Recommended:
+    // GEMINI_API_KEY in Vercel Environment Variables.
+    //
+    // body.key is kept for compatibility with the current
+    // AutoTouch client.
+    // --------------------------------------------------------
 
     const key =
-      body.key ||
-      process.env
-        .GEMINI_API_KEY;
+      cleanText(body.key) ||
+      cleanText(process.env.GEMINI_API_KEY);
 
     if (!key) {
-      return res
-        .status(200)
-        .json({
-          success: false,
-          error:
-            "Thiếu Gemini API key.",
-          version:
-            VERSION,
-        });
+      return res.status(200).json({
+        success: false,
+        error: "Missing GEMINI_API_KEY.",
+        version: VERSION,
+      });
     }
 
-    const imageData =
-      normalizeImage(
-        body.image
-      );
+    // --------------------------------------------------------
+    // IMAGE
+    // --------------------------------------------------------
 
-    const size =
-      getImageSize(
-        imageData.data
-      );
+    let image;
 
-    if (
-      !size ||
-      !size.width ||
-      !size.height
-    ) {
-      throw httpError(
-        "Không đọc được kích thước ảnh.",
-        400
-      );
+    try {
+      image = normalizeImage(body.image);
+    } catch (error) {
+      return res.status(200).json({
+        success: false,
+        error:
+          error?.message ||
+          "Invalid image.",
+        version: VERSION,
+      });
     }
+
+    const {
+      width: imageWidth,
+      height: imageHeight,
+    } = getImageSize(image);
+
+    // --------------------------------------------------------
+    // INPUTS
+    // --------------------------------------------------------
+
+    const goal =
+      cleanText(body.goal) ||
+      "Complete the current Facebook signup flow.";
 
     const info =
-      body.info || "";
+      typeof body.info === "string"
+        ? body.info
+        : "";
+
+    const rules = Array.isArray(body.rules)
+      ? body.rules
+      : [];
+
+    const history = Array.isArray(body.history)
+      ? body.history
+      : [];
 
     const mode =
-      body.mode ===
-      "recover"
+      body.mode === "recover"
         ? "recover"
         : "normal";
 
-    const raw =
-      await callGemini({
-        imageData,
-        key,
+    const failure =
+      body.failure &&
+      typeof body.failure === "object"
+        ? body.failure
+        : null;
 
-        goal:
-          body.goal ||
-          "Hoàn thành màn hình đăng ký hiện tại và chuyển sang bước tiếp theo.",
+    // --------------------------------------------------------
+    // PROMPT
+    // --------------------------------------------------------
 
-        info,
+    const prompt = buildPrompt({
+      goal,
+      info,
+      rules,
+      history,
+      mode,
+      failure,
+    });
 
-        rules:
-          body.rules || [],
+    // --------------------------------------------------------
+    // MODEL
+    // --------------------------------------------------------
 
-        history:
-          body.history || [],
+    const model =
+      mode === "recover"
+        ? RECOVERY_MODEL
+        : MODEL_ID;
 
+    // --------------------------------------------------------
+    // GEMINI
+    // --------------------------------------------------------
+
+    const payload = await askGemini({
+      model,
+      key,
+      image,
+      prompt,
+    });
+
+    // --------------------------------------------------------
+    // TEXT
+    // --------------------------------------------------------
+
+    const modelText =
+      extractGeminiText(payload);
+
+    // --------------------------------------------------------
+    // JSON
+    // --------------------------------------------------------
+
+    const rawAction =
+      parseModelJSON(modelText);
+
+    // --------------------------------------------------------
+    // NORMALIZE
+    // --------------------------------------------------------
+
+    const action = normalizeAction(
+      rawAction,
+      info,
+      imageWidth,
+      imageHeight
+    );
+
+    // --------------------------------------------------------
+    // DIAGNOSIS
+    //
+    // Only useful in recovery mode.
+    // --------------------------------------------------------
+
+    const diagnosis =
+      mode === "recover"
+        ? cleanText(rawAction?.diagnosis)
+        : "";
+
+    // --------------------------------------------------------
+    // IMPORTANT:
+    // If normalizeAction detects invalid plan, return
+    // success=false instead of silently executing it.
+    // --------------------------------------------------------
+
+    if (action.action === "fail") {
+      const reason =
+        action.reason ||
+        "Invalid AI action.";
+
+      return res.status(200).json({
+        success: false,
+        action: "fail",
+        reason,
+        diagnosis,
         mode,
-
-        failure:
-          body.failure || "",
+        image_width: imageWidth,
+        image_height: imageHeight,
+        model,
+        version: VERSION,
       });
+    }
 
-    const action =
-      normalizeAction(
-        raw,
-        size,
-        info
-      );
+    // --------------------------------------------------------
+    // NORMAL RESPONSE
+    // --------------------------------------------------------
 
-    return res
-      .status(200)
-      .json({
-        success: true,
+    return res.status(200).json({
+      success: true,
 
-        ...action,
+      action: action.action,
 
-        ...(mode ===
-        "recover"
-          ? {
-              mode,
-              diagnosis:
-                limit(
-                  raw?.diagnosis,
-                  500
-                ),
-            }
-          : {}),
+      // tap
+      ...(action.x !== undefined
+        ? { x: action.x }
+        : {}),
 
-        image_width:
-          size.width,
+      ...(action.y !== undefined
+        ? { y: action.y }
+        : {}),
 
-        image_height:
-          size.height,
+      // swipe
+      ...(action.x1 !== undefined
+        ? { x1: action.x1 }
+        : {}),
 
-        model:
-          mode === "recover"
-            ? RECOVER_MODEL
-            : MODEL_ID,
+      ...(action.y1 !== undefined
+        ? { y1: action.y1 }
+        : {}),
 
-        version:
-          VERSION,
-      });
+      ...(action.x2 !== undefined
+        ? { x2: action.x2 }
+        : {}),
+
+      ...(action.y2 !== undefined
+        ? { y2: action.y2 }
+        : {}),
+
+      ...(action.duration !== undefined
+        ? { duration: action.duration }
+        : {}),
+
+      // type
+      ...(action.text !== undefined
+        ? { text: action.text }
+        : {}),
+
+      // wait
+      ...(action.seconds !== undefined
+        ? { seconds: action.seconds }
+        : {}),
+
+      // wheel
+      ...(action.rows !== undefined
+        ? { rows: action.rows }
+        : {}),
+
+      // plan
+      ...(Array.isArray(action.steps)
+        ? { steps: action.steps }
+        : {}),
+
+      reason:
+        action.reason || "",
+
+      diagnosis,
+
+      mode,
+
+      image_width: imageWidth,
+      image_height: imageHeight,
+
+      model,
+      version: VERSION,
+    });
   } catch (error) {
+    // --------------------------------------------------------
+    // IMPORTANT:
+    // Do not let normal Gemini/API failures crash the Vercel
+    // function. Always return JSON to AutoTouch.
+    // --------------------------------------------------------
+
+    const model =
+      MODEL_ID;
+
     const message =
-      friendlyError(
-        error
-      );
+      friendlyError(error, model);
 
     console.error(
       "[ANALYZE ERROR]",
-      message
-    );
-
-    console.error(
-      "[ANALYZE STACK]",
       error?.stack ||
-        ""
+        error?.message ||
+        error
     );
 
-    try {
-      if (
-        isFatal(error)
-      ) {
-        return res
-          .status(200)
-          .json({
-            success: false,
+    // Fatal configuration/API errors
+    if (isFatal(error)) {
+      return res.status(200).json({
+        success: false,
+        action: "fail",
+        reason: message,
+        error: message,
+        mode: "normal",
+        model,
+        version: VERSION,
+      });
+    }
 
-            error:
-              message,
+    // --------------------------------------------------------
+    // TRANSIENT ERROR
+    //
+    // Tell AutoTouch to wait instead of crashing.
+    // --------------------------------------------------------
 
-            model:
-              MODEL_ID,
-
-            version:
-              VERSION,
-          });
-      }
-
-      return res
-        .status(200)
-        .json({
-          success: true,
-
-          ...waitAction(
-            message,
-            3
-          ),
-
-          model:
-            MODEL_ID,
-
-          version:
-            VERSION,
-        });
-    } catch {}
+    return res.status(200).json({
+      success: true,
+      action: "wait",
+      seconds: 3,
+      reason: message,
+      transient_error: true,
+      model,
+      version: VERSION,
+    });
   }
 }
