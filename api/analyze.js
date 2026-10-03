@@ -1,139 +1,163 @@
 // ============================================================
 // pages/api/analyze.js
 // AUTOTOUCH VISION AGENT
-// VERSION: 6.5 - GEMINI 3.5 FLASH LITE / SAFE FALLBACK FIX
+// VERSION 6.6
 //
-// Request:
-// {
-//   image,
-//   key,
-//   goal,
-//   info,
-//   rules[],
-//   history[]
-// }
-//
-// Response:
-// {
-//   success,
-//   transient,
-//   state,
-//   confidence,
-//   observations,
-//   diagnosis,
-//   decision,
-//   action,
-//   reason
-// }
-//
-// ACTION:
-//   tap
-//   type
-//   swipe
-//   wait
-//   plan
-//   wheel
-//   done
-//   fail
-//
-// IMPORTANT:
-//   - Chỉ dùng Gemini 3.5 Flash Lite
-//   - Không coi "Wait and observe" là AI error
-//   - JSON lỗi -> recovery
-//   - Recovery vẫn dùng Gemini 3.5 Flash Lite
+// FIX:
+// - Vercel FUNCTION_INVOCATION_FAILED
+// - Gemini 3.5 Flash Lite
+// - Image vision
+// - JSON parser recovery
+// - Không để exception làm chết function
+// - Wait không còn bị coi là AI error
+// ============================================================
+
+const MODEL_NAME = "gemini-3.5-flash-lite";
+
+const GEMINI_URL =
+  "https://generativelanguage.googleapis.com/v1beta/models/" +
+  MODEL_NAME +
+  ":generateContent";
+
+
+// ============================================================
+// NEXT API CONFIG
 // ============================================================
 
 export const config = {
   api: {
     bodyParser: {
-      sizeLimit: "12mb",
+      sizeLimit: "15mb",
     },
   },
 };
 
-// ============================================================
-// CONFIG
-// ============================================================
-
-const MODEL_NAME = "gemini-3.5-flash-lite";
-
-const GEMINI_API_BASE =
-  "https://generativelanguage.googleapis.com/v1beta/models";
-
-const MAX_HISTORY = 12;
-const MAX_RULES = 30;
-const MAX_INFO_LENGTH = 5000;
 
 // ============================================================
-// UTIL
+// SAFE STRING
 // ============================================================
 
-function safeString(value, max = 5000) {
-  if (value === null || value === undefined) return "";
-  return String(value).slice(0, max);
-}
-
-function clampNumber(value, min, max, fallback) {
-  const n = Number(value);
-
-  if (!Number.isFinite(n)) {
-    return fallback;
+function str(value, max) {
+  if (value === undefined || value === null) {
+    return "";
   }
 
-  return Math.max(min, Math.min(max, n));
+  let s = String(value);
+
+  if (max && s.length > max) {
+    s = s.slice(0, max);
+  }
+
+  return s;
 }
 
-function cleanArray(value, max = 20) {
-  if (!Array.isArray(value)) return [];
+
+// ============================================================
+// ARRAY
+// ============================================================
+
+function arr(value, max) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
 
   return value
-    .slice(-max)
-    .map((x) => safeString(x, 1000))
+    .slice(-(max || 20))
+    .map(function (x) {
+      return str(x, 1000);
+    })
     .filter(Boolean);
 }
 
-function stripCodeFence(text) {
-  let s = safeString(text, 30000).trim();
 
-  if (s.startsWith("```")) {
-    s = s.replace(/^```(?:json)?/i, "");
-    s = s.replace(/```$/i, "");
-  }
+// ============================================================
+// IMAGE
+// ============================================================
 
-  return s.trim();
-}
-
-function parseJsonSafe(text) {
-  const raw = stripCodeFence(text);
-
-  if (!raw) {
+function parseImage(image) {
+  if (!image) {
     return null;
   }
 
+  var value = String(image).trim();
+
+  if (
+    value.indexOf("data:image/") === 0
+  ) {
+    var comma = value.indexOf(",");
+
+    if (comma !== -1) {
+      var header = value.slice(0, comma);
+      var data = value.slice(comma + 1);
+
+      var match =
+        header.match(
+          /^data:(image\/[^;]+);base64$/i
+        );
+
+      return {
+        mimeType:
+          match && match[1]
+            ? match[1]
+            : "image/jpeg",
+
+        data: data,
+      };
+    }
+  }
+
+  return {
+    mimeType: "image/jpeg",
+    data: value,
+  };
+}
+
+
+// ============================================================
+// JSON EXTRACT
+// ============================================================
+
+function parseModelJSON(text) {
+  if (!text) {
+    return null;
+  }
+
+  var s = String(text).trim();
+
+  // remove markdown fence
+  s = s.replace(/^```json\s*/i, "");
+  s = s.replace(/^```\s*/i, "");
+  s = s.replace(/\s*```$/i, "");
+  s = s.trim();
+
+  // direct JSON
   try {
-    return JSON.parse(raw);
-  } catch (_) {}
+    return JSON.parse(s);
+  } catch (e) {}
 
-  // ----------------------------------------------------------
-  // Thử lấy object JSON đầu tiên trong response
-  // ----------------------------------------------------------
+  // tìm object đầu tiên
+  var start = s.indexOf("{");
+  var end = s.lastIndexOf("}");
 
-  const first = raw.indexOf("{");
-  const last = raw.lastIndexOf("}");
-
-  if (first >= 0 && last > first) {
-    const candidate = raw.slice(first, last + 1);
+  if (
+    start !== -1 &&
+    end !== -1 &&
+    end > start
+  ) {
+    var candidate =
+      s.slice(start, end + 1);
 
     try {
       return JSON.parse(candidate);
-    } catch (_) {}
+    } catch (e) {}
   }
 
   return null;
 }
 
+
 // ============================================================
-// NORMALIZE ACTION
+// ACTION NORMALIZER
 // ============================================================
 
 function normalizeAction(action) {
@@ -141,17 +165,26 @@ function normalizeAction(action) {
     return null;
   }
 
-  const type = safeString(action.type, 40).toLowerCase().trim();
+  var type =
+    str(action.type, 50)
+      .toLowerCase()
+      .trim();
 
   // ----------------------------------------------------------
   // TAP
   // ----------------------------------------------------------
 
-  if (type === "tap" || type === "click") {
-    const x = clampNumber(action.x, 0, 10000, NaN);
-    const y = clampNumber(action.y, 0, 10000, NaN);
+  if (
+    type === "tap" ||
+    type === "click"
+  ) {
+    var x = Number(action.x);
+    var y = Number(action.y);
 
-    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    if (
+      !isFinite(x) ||
+      !isFinite(y)
+    ) {
       return null;
     }
 
@@ -162,11 +195,15 @@ function normalizeAction(action) {
     };
   }
 
+
   // ----------------------------------------------------------
   // TYPE
   // ----------------------------------------------------------
 
-  if (type === "type" || type === "input") {
+  if (
+    type === "type" ||
+    type === "input"
+  ) {
     if (
       action.text === undefined ||
       action.text === null
@@ -180,21 +217,54 @@ function normalizeAction(action) {
     };
   }
 
+
+  // ----------------------------------------------------------
+  // WAIT
+  // ----------------------------------------------------------
+
+  if (type === "wait") {
+    var ms = Number(action.ms);
+
+    if (!isFinite(ms)) {
+      var seconds =
+        Number(action.seconds);
+
+      if (isFinite(seconds)) {
+        ms = seconds * 1000;
+      }
+    }
+
+    if (!isFinite(ms)) {
+      ms = 1200;
+    }
+
+    ms = Math.max(
+      300,
+      Math.min(ms, 5000)
+    );
+
+    return {
+      type: "wait",
+      ms: Math.round(ms),
+    };
+  }
+
+
   // ----------------------------------------------------------
   // SWIPE
   // ----------------------------------------------------------
 
   if (type === "swipe") {
-    const x1 = clampNumber(action.x1, 0, 10000, NaN);
-    const y1 = clampNumber(action.y1, 0, 10000, NaN);
-    const x2 = clampNumber(action.x2, 0, 10000, NaN);
-    const y2 = clampNumber(action.y2, 0, 10000, NaN);
+    var x1 = Number(action.x1);
+    var y1 = Number(action.y1);
+    var x2 = Number(action.x2);
+    var y2 = Number(action.y2);
 
     if (
-      !Number.isFinite(x1) ||
-      !Number.isFinite(y1) ||
-      !Number.isFinite(x2) ||
-      !Number.isFinite(y2)
+      !isFinite(x1) ||
+      !isFinite(y1) ||
+      !isFinite(x2) ||
+      !isFinite(y2)
     ) {
       return null;
     }
@@ -205,41 +275,43 @@ function normalizeAction(action) {
       y1: Math.round(y1),
       x2: Math.round(x2),
       y2: Math.round(y2),
-      duration: clampNumber(
-        action.duration,
-        0.1,
-        5,
-        0.5
-      ),
+      duration:
+        isFinite(Number(action.duration))
+          ? Number(action.duration)
+          : 0.5,
     };
   }
 
+
   // ----------------------------------------------------------
-  // WAIT
+  // WHEEL
   // ----------------------------------------------------------
 
-  if (type === "wait") {
-    let ms = Number(action.ms);
-
-    if (!Number.isFinite(ms)) {
-      const seconds = Number(action.seconds);
-
-      if (Number.isFinite(seconds)) {
-        ms = seconds * 1000;
-      }
-    }
-
-    if (!Number.isFinite(ms)) {
-      ms = 1200;
-    }
-
+  if (type === "wheel") {
     return {
-      type: "wait",
-      ms: Math.round(
-        Math.max(300, Math.min(ms, 5000))
-      ),
+      type: "wheel",
+
+      direction:
+        str(
+          action.direction,
+          20
+        ).toLowerCase() === "up"
+          ? "up"
+          : "down",
+
+      amount:
+        isFinite(Number(action.amount))
+          ? Math.max(
+              1,
+              Math.min(
+                20,
+                Number(action.amount)
+              )
+            )
+          : 3,
     };
   }
+
 
   // ----------------------------------------------------------
   // DONE
@@ -255,57 +327,48 @@ function normalizeAction(action) {
     };
   }
 
+
   // ----------------------------------------------------------
   // FAIL
   // ----------------------------------------------------------
 
-  if (type === "fail" || type === "error") {
+  if (
+    type === "fail" ||
+    type === "error"
+  ) {
     return {
       type: "fail",
-      reason: safeString(
-        action.reason || action.message,
+      reason: str(
+        action.reason ||
+          action.message ||
+          "AI reported failure.",
         500
       ),
     };
   }
 
-  // ----------------------------------------------------------
-  // WHEEL
-  // ----------------------------------------------------------
-
-  if (type === "wheel") {
-    return {
-      type: "wheel",
-      direction:
-        safeString(action.direction || "down", 20)
-          .toLowerCase() === "up"
-          ? "up"
-          : "down",
-      amount: clampNumber(
-        action.amount,
-        1,
-        20,
-        3
-      ),
-    };
-  }
 
   // ----------------------------------------------------------
   // PLAN
   // ----------------------------------------------------------
 
   if (type === "plan") {
-    const rawSteps =
+    var source =
       Array.isArray(action.steps)
         ? action.steps
         : Array.isArray(action.plan)
         ? action.plan
         : [];
 
-    const steps = [];
+    var steps = [];
 
-    for (const step of rawSteps.slice(0, 8)) {
-      const normalized = normalizeAction(step);
+    for (
+      var i = 0;
+      i < source.length && i < 8;
+      i++
+    ) {
+      var normalized =
+        normalizeAction(source[i]);
 
       if (normalized) {
         steps.push(normalized);
@@ -318,245 +381,205 @@ function normalizeAction(action) {
 
     return {
       type: "plan",
-      steps,
+      steps: steps,
     };
   }
 
   return null;
 }
 
+
 // ============================================================
-// NORMALIZE MODEL RESPONSE
+// WAIT RESPONSE
 // ============================================================
 
-function normalizeModelResponse(data) {
-  if (!data || typeof data !== "object") {
-    return null;
-  }
-
-  let action = normalizeAction(data.action);
-
-  // ----------------------------------------------------------
-  // Một số model có thể trả decision thay vì action
-  // ----------------------------------------------------------
-
-  if (!action && data.decision) {
-    const decision =
-      safeString(data.decision, 200)
-        .toLowerCase()
-        .trim();
-
-    if (
-      decision.includes("wait") ||
-      decision.includes("observe") ||
-      decision.includes("chờ") ||
-      decision.includes("quan sát")
-    ) {
-      action = {
-        type: "wait",
-        ms: 1200,
-      };
-    }
-  }
-
-  // ----------------------------------------------------------
-  // Nếu không có action thì không coi là lỗi server.
-  // Cho AutoTouch wait rồi chụp lại.
-  // ----------------------------------------------------------
-
-  if (!action) {
-    action = {
-      type: "wait",
-      ms: 1200,
-    };
-  }
-
-  const confidence = clampNumber(
-    data.confidence,
-    0,
-    1,
-    0.5
-  );
-
-  let state =
-    safeString(data.state, 80)
-      .toLowerCase()
-      .trim();
-
-  if (!state) {
-    state = "observed";
-  }
-
-  let decision =
-    safeString(data.decision, 300);
-
-  if (!decision) {
-    decision =
-      action.type === "wait"
-        ? "Wait and observe"
-        : `Execute ${action.type}`;
-  }
-
-  const observations = cleanArray(
-    data.observations,
-    12
-  );
-
-  const diagnosis =
-    safeString(
-      data.diagnosis || data.reason,
-      1000
-    );
-
+function waitResponse(reason) {
   return {
     success: true,
     transient: false,
-    state,
-    confidence,
-    observations,
-    diagnosis:
-      diagnosis || "Vision analysis completed.",
-    decision,
-    action,
-    reason:
-      safeString(
-        data.reason || decision,
-        1000
-      ),
-  };
-}
 
-// ============================================================
-// FALLBACK
-// ============================================================
-
-function waitResponse(reason = "Wait and observe.") {
-  return {
-    success: true,
-    transient: false,
     state: "waiting",
+
     confidence: 0.2,
+
     observations: [],
-    diagnosis: reason,
-    decision: "Wait and observe",
+
+    diagnosis:
+      reason ||
+      "Đang chờ màn hình ổn định.",
+
+    decision:
+      "Wait and observe",
+
     action: {
       type: "wait",
       ms: 1200,
     },
-    reason,
+
+    reason:
+      reason ||
+      "Chụp lại màn hình và quan sát tiếp.",
   };
 }
 
-// ============================================================
-// ERROR RESPONSE
-// ============================================================
-
-function transientError(message) {
-  return {
-    success: false,
-    transient: true,
-    state: "server_error",
-    confidence: 0,
-    observations: [],
-    diagnosis: safeString(message, 1000),
-    decision: "Retry",
-    action: {
-      type: "wait",
-      ms: 1500,
-    },
-    reason: safeString(message, 1000),
-  };
-}
 
 // ============================================================
-// IMAGE NORMALIZATION
+// BUILD PROMPT
 // ============================================================
 
-function normalizeImage(image) {
-  if (!image) {
-    return null;
-  }
-
-  let value = String(image).trim();
-
-  // ----------------------------------------------------------
-  // data:image/jpeg;base64,...
-  // ----------------------------------------------------------
-
-  if (value.startsWith("data:image/")) {
-    const comma = value.indexOf(",");
-
-    if (comma >= 0) {
-      const header = value.slice(0, comma);
-      const data = value.slice(comma + 1);
-
-      let mimeType = "image/jpeg";
-
-      const match =
-        header.match(
-          /^data:(image\/[a-zA-Z0-9.+-]+);base64$/i
+function buildPrompt(
+  goal,
+  info,
+  rules,
+  history,
+  recovery
+) {
+  var rulesText =
+    arr(rules, 30)
+      .map(function (x, i) {
+        return (
+          (i + 1) +
+          ". " +
+          x
         );
+      })
+      .join("\n");
 
-      if (match) {
-        mimeType = match[1];
-      }
+  var historyText =
+    arr(history, 12)
+      .map(function (x, i) {
+        return (
+          (i + 1) +
+          ". " +
+          x
+        );
+      })
+      .join("\n");
 
-      return {
-        mimeType,
-        data,
-      };
-    }
-  }
+  return `
+Bạn là AI điều khiển AutoTouch bằng screenshot.
 
-  // ----------------------------------------------------------
-  // Nếu client gửi raw base64
-  // ----------------------------------------------------------
+MỤC TIÊU:
+${str(goal, 1000)}
 
-  return {
-    mimeType: "image/jpeg",
-    data: value,
-  };
+INFO:
+${str(info, 5000)}
+
+RULES:
+${rulesText || "(none)"}
+
+HISTORY:
+${historyText || "(none)"}
+
+Hãy nhìn kỹ screenshot.
+
+QUY TẮC QUAN TRỌNG:
+
+1. Screenshot là nguồn sự thật.
+2. Chỉ trả về đúng 1 action tiếp theo.
+3. Nếu có nút rõ ràng thì ưu tiên tap.
+4. Không được tap ngẫu nhiên.
+5. Không được bịa UI.
+6. Nếu đang loading thì wait.
+7. Nếu màn hình rõ và có nút "Bắt đầu", "Tiếp",
+   "Tiếp tục", "Xác nhận", "Đăng ký",
+   hoặc "Tiếp theo", hãy tap nút phù hợp.
+8. Không trả action rỗng.
+9. Nếu chưa chắc nhưng có một action an toàn
+   rõ ràng thì thực hiện action đó.
+10. Chỉ dùng wait khi thật sự chưa có action an toàn.
+
+MẬT KHẨU:
+
+- Mật khẩu chỉ được nhập một lần.
+- Nếu HISTORY cho biết password đã nhập,
+  tuyệt đối không type password lần nữa.
+- Không nhập lại password chỉ vì ô bị mask,
+  hiện dấu chấm hoặc nhìn giống trống.
+- Không đưa password vào observations/reason.
+
+TRẢ VỀ JSON THUẦN:
+
+{
+  "state": "...",
+  "confidence": 0.0,
+  "observations": ["..."],
+  "diagnosis": "...",
+  "decision": "...",
+  "action": {
+    "type": "tap",
+    "x": 123,
+    "y": 456
+  },
+  "reason": "..."
 }
+
+ACTION HỢP LỆ:
+
+tap
+type
+swipe
+wait
+wheel
+plan
+done
+fail
+
+${
+  recovery
+    ? `
+ĐÂY LÀ LẦN PHÂN TÍCH RECOVERY.
+
+Lần trước chưa tạo được action hợp lệ.
+Hãy kiểm tra lại toàn bộ screenshot,
+đặc biệt tìm nút "Bắt đầu" và các nút điều hướng.
+Nếu thấy action rõ ràng thì trả action đó.
+`
+    : ""
+}
+
+CHỈ TRẢ JSON.
+`;
+}
+
 
 // ============================================================
 // GEMINI CALL
 // ============================================================
 
-async function callGemini({
+async function callGemini(
   apiKey,
   image,
-  systemInstruction,
-  prompt,
-}) {
-  const imageData = normalizeImage(image);
+  prompt
+) {
+  var parsedImage =
+    parseImage(image);
 
-  if (!imageData || !imageData.data) {
-    throw new Error("Missing image data.");
+  if (
+    !parsedImage ||
+    !parsedImage.data
+  ) {
+    throw new Error(
+      "IMAGE_MISSING"
+    );
   }
 
-  const url =
-    `${GEMINI_API_BASE}/${MODEL_NAME}:generateContent` +
-    `?key=${encodeURIComponent(apiKey)}`;
-
-  const body = {
-    systemInstruction: {
-      parts: [
-        {
-          text: systemInstruction,
-        },
-      ],
-    },
-
+  var payload = {
     contents: [
       {
         role: "user",
+
         parts: [
           {
-            inline_data: {
-              mime_type: imageData.mimeType,
-              data: imageData.data,
+            inlineData: {
+              mimeType:
+                parsedImage.mimeType,
+
+              data:
+                parsedImage.data,
             },
           },
+
           {
             text: prompt,
           },
@@ -568,330 +591,114 @@ async function callGemini({
       temperature: 0.1,
       topP: 0.8,
       maxOutputTokens: 1800,
-      responseMimeType: "application/json",
     },
   };
 
-  const controller =
-    new AbortController();
+  var response =
+    await fetch(
+      GEMINI_URL +
+        "?key=" +
+        encodeURIComponent(apiKey),
+      {
+        method: "POST",
 
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, 30000);
+        headers: {
+          "Content-Type":
+            "application/json",
+        },
 
-  let response;
+        body: JSON.stringify(
+          payload
+        ),
+      }
+    );
 
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  const text = await response.text();
+  var raw =
+    await response.text();
 
   if (!response.ok) {
-    let detail = text;
+    var message =
+      "Gemini HTTP " +
+      response.status;
 
     try {
-      const json = JSON.parse(text);
+      var errorJson =
+        JSON.parse(raw);
 
-      detail =
-        json?.error?.message ||
-        json?.error ||
-        text;
-    } catch (_) {}
+      if (
+        errorJson &&
+        errorJson.error &&
+        errorJson.error.message
+      ) {
+        message =
+          errorJson.error.message;
+      }
+    } catch (e) {}
 
-    throw new Error(
-      `Gemini HTTP ${response.status}: ${safeString(
-        detail,
-        1200
-      )}`
-    );
+    throw new Error(message);
   }
 
-  let json;
+  var data;
 
   try {
-    json = JSON.parse(text);
-  } catch (_) {
+    data =
+      JSON.parse(raw);
+  } catch (e) {
     throw new Error(
-      "Gemini returned invalid HTTP JSON."
+      "GEMINI_INVALID_HTTP_JSON"
     );
   }
 
-  const candidate =
-    json?.candidates?.[0];
+  var candidates =
+    data.candidates || [];
 
-  const parts =
-    candidate?.content?.parts || [];
+  if (!candidates.length) {
+    throw new Error(
+      "GEMINI_NO_CANDIDATE"
+    );
+  }
 
-  let output = "";
+  var parts =
+    candidates[0] &&
+    candidates[0].content &&
+    candidates[0].content.parts
+      ? candidates[0].content.parts
+      : [];
 
-  for (const part of parts) {
-    if (part && typeof part.text === "string") {
-      output += part.text;
+  var output = "";
+
+  for (
+    var i = 0;
+    i < parts.length;
+    i++
+  ) {
+    if (
+      parts[i] &&
+      typeof parts[i].text ===
+        "string"
+    ) {
+      output += parts[i].text;
     }
   }
 
   if (!output.trim()) {
     throw new Error(
-      "Gemini returned an empty response."
+      "GEMINI_EMPTY_OUTPUT"
     );
   }
 
-  const parsed =
-    parseJsonSafe(output);
-
-  if (!parsed) {
-    throw new Error(
-      "Gemini returned invalid action JSON."
-    );
-  }
-
-  return parsed;
+  return output;
 }
 
-// ============================================================
-// SYSTEM PROMPT
-// ============================================================
-
-function buildSystemInstruction() {
-  return `
-You are the vision controller for an AutoTouch UI agent.
-
-MODEL:
-Gemini 3.5 Flash Lite.
-
-YOUR JOB:
-Look at the supplied screenshot and choose exactly ONE next action.
-
-IMPORTANT:
-The screenshot is the source of truth.
-
-DO NOT invent UI elements.
-
-DO NOT describe what the user should manually do.
-
-RETURN JSON ONLY.
-
-VALID ACTIONS:
-
-1. tap
-{
-  "type": "tap",
-  "x": 123,
-  "y": 456
-}
-
-2. type
-{
-  "type": "type",
-  "text": "..."
-}
-
-3. swipe
-{
-  "type": "swipe",
-  "x1": 100,
-  "y1": 700,
-  "x2": 100,
-  "y2": 300,
-  "duration": 0.5
-}
-
-4. wait
-{
-  "type": "wait",
-  "ms": 1200
-}
-
-5. wheel
-{
-  "type": "wheel",
-  "direction": "down",
-  "amount": 3
-}
-
-6. plan
-{
-  "type": "plan",
-  "steps": [
-    {
-      "type": "tap",
-      "x": 100,
-      "y": 200
-    },
-    {
-      "type": "type",
-      "text": "..."
-    }
-  ]
-}
-
-7. done
-{
-  "type": "done"
-}
-
-8. fail
-{
-  "type": "fail",
-  "reason": "..."
-}
-
-RESPONSE FORMAT:
-
-{
-  "state": "string",
-  "confidence": 0.0,
-  "observations": ["..."],
-  "diagnosis": "...",
-  "decision": "...",
-  "action": {
-    ...
-  },
-  "reason": "..."
-}
-
-IMPORTANT UI RULES:
-
-- If a button is clearly visible and it is the next logical step, TAP IT.
-- Do not return "unknown" merely because the screen is unfamiliar.
-- Do not return an empty observations array if visible UI elements can be identified.
-- If the screenshot is clear but you are not completely certain, choose the safest visible next action.
-- Only use wait when there genuinely is no safe visible action.
-- If the screen is loading, use wait.
-- If a keyboard is visible and the next field is clearly active, use the appropriate type action.
-- Do not tap random areas.
-- Prefer the center of a clearly visible button.
-- Do not create coordinates outside the screenshot.
-- Never expose or repeat secrets in observations, diagnosis, or reason.
-
-PASSWORD RULE:
-
-The client controls password entry.
-
-The password must be entered only ONCE during the whole session.
-
-If history says the password was already entered:
-- NEVER return a type action containing that password.
-- NEVER ask the client to type it again.
-- Even if a password field looks visually empty because it is masked, assume the password may already have been entered.
-- Choose the next non-password action or wait for the UI to update.
-
-CONFIRM PASSWORD:
-
-The client has an explicit single-entry password policy.
-Do not force a second password type action merely because a confirmation field appears visually empty.
-
-VERY IMPORTANT:
-
-If the screenshot clearly shows a button such as:
-"Bắt đầu"
-"Tiếp"
-"Tiếp tục"
-"Đăng ký"
-"Xác nhận"
-"Tiếp theo"
-
-and it is obviously the next step, return a tap action.
-
-Do not return:
-"Safe fallback required"
-when a visible safe action exists.
-`;
-}
-
-// ============================================================
-// USER PROMPT
-// ============================================================
-
-function buildUserPrompt({
-  goal,
-  info,
-  rules,
-  history,
-  recovery = false,
-}) {
-  const safeRules = cleanArray(
-    rules,
-    MAX_RULES
-  );
-
-  const safeHistory = cleanArray(
-    history,
-    MAX_HISTORY
-  );
-
-  const safeInfo = safeString(
-    info,
-    MAX_INFO_LENGTH
-  );
-
-  return `
-GOAL:
-${safeString(goal, 1000)}
-
-INFO:
-${safeInfo}
-
-RULES:
-${safeRules.map((x, i) => `${i + 1}. ${x}`).join("\n")}
-
-RECENT HISTORY:
-${
-  safeHistory.length
-    ? safeHistory
-        .map((x, i) => `${i + 1}. ${x}`)
-        .join("\n")
-    : "(none)"
-}
-
-${
-  recovery
-    ? `
-RECOVERY ANALYSIS:
-
-The previous vision response was missing, invalid, or too conservative.
-
-Re-examine the screenshot carefully.
-
-Look specifically for:
-- visible buttons
-- active input fields
-- keyboard
-- loading indicators
-- navigation controls
-- "Bắt đầu"
-- "Tiếp"
-- "Tiếp tục"
-- "Đăng ký"
-- "Xác nhận"
-- "Tiếp theo"
-
-If a clear safe UI action exists, return that action instead of wait.
-
-Do not return an empty action.
-`
-    : ""
-}
-
-Return exactly one JSON object.
-`;
-}
 
 // ============================================================
 // MAIN HANDLER
 // ============================================================
 
-export default async function handler(req, res) {
+export default async function handler(
+  req,
+  res
+) {
   // ----------------------------------------------------------
   // CORS
   // ----------------------------------------------------------
@@ -912,243 +719,412 @@ export default async function handler(req, res) {
   );
 
   if (req.method === "OPTIONS") {
-    return res.status(200).end();
+    return res
+      .status(200)
+      .end();
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json({
-      success: false,
-      transient: false,
-      error: "POST only",
-    });
+    return res
+      .status(405)
+      .json({
+        success: false,
+        error: "POST only",
+      });
   }
 
+  // ----------------------------------------------------------
+  // EVERYTHING INSIDE TRY
+  // ----------------------------------------------------------
+
   try {
-    const body = req.body || {};
+    var body =
+      req.body || {};
 
-    // --------------------------------------------------------
-    // API KEY
-    //
-    // Ưu tiên:
-    //   1. body.key
-    //   2. GEMINI_API_KEY
-    //
-    // --------------------------------------------------------
-
-    const apiKey =
-      safeString(
+    var apiKey =
+      str(
         body.key ||
-        process.env.GEMINI_API_KEY,
-        500
+          process.env.GEMINI_API_KEY,
+        1000
       ).trim();
 
     if (!apiKey) {
-      return res.status(500).json(
-        transientError(
-          "Gemini API key is missing."
-        )
+      console.error(
+        "[ANALYZE] GEMINI API KEY MISSING"
       );
+
+      return res
+        .status(200)
+        .json(
+          waitResponse(
+            "Gemini API key is missing."
+          )
+        );
     }
 
-    // --------------------------------------------------------
-    // INPUT
-    // --------------------------------------------------------
-
-    const image = body.image;
+    var image =
+      body.image;
 
     if (!image) {
-      return res.status(400).json(
-        transientError(
-          "Image is missing."
-        )
-      );
+      return res
+        .status(200)
+        .json(
+          waitResponse(
+            "Screenshot is missing."
+          )
+        );
     }
 
-    const goal =
-      safeString(
+    var goal =
+      str(
         body.goal,
         1000
       ) ||
-      "Hoàn thành màn hình hiện tại và chuyển sang bước tiếp theo.";
+      "Hoàn thành màn hình đăng ký hiện tại và chuyển sang bước tiếp theo.";
 
-    const info =
-      safeString(
+    var info =
+      str(
         body.info,
-        MAX_INFO_LENGTH
+        5000
       );
 
-    const rules =
+    var rules =
       Array.isArray(body.rules)
         ? body.rules
         : [];
 
-    const history =
+    var history =
       Array.isArray(body.history)
         ? body.history
         : [];
 
-    // --------------------------------------------------------
-    // SYSTEM + PROMPT
-    // --------------------------------------------------------
-
-    const systemInstruction =
-      buildSystemInstruction();
-
-    const prompt =
-      buildUserPrompt({
-        goal,
-        info,
-        rules,
-        history,
-        recovery: false,
-      });
 
     // --------------------------------------------------------
-    // PRIMARY GEMINI
+    // PRIMARY
     // --------------------------------------------------------
 
-    let rawResult = null;
+    var output = null;
+    var primaryError = null;
 
     try {
-      rawResult = await callGemini({
-        apiKey,
-        image,
-        systemInstruction,
-        prompt,
-      });
-    } catch (primaryError) {
-      // ------------------------------------------------------
-      // Không chết ngay.
-      // Recovery bằng cùng Gemini 3.5 Flash Lite.
-      // ------------------------------------------------------
-
-      try {
-        rawResult = await callGemini({
+      output =
+        await callGemini(
           apiKey,
           image,
-          systemInstruction,
-          prompt: buildUserPrompt({
+          buildPrompt(
             goal,
             info,
             rules,
             history,
-            recovery: true,
-          }),
-        });
-      } catch (recoveryError) {
-        return res.status(200).json(
-          waitResponse(
-            "Vision service temporarily unavailable. Retry with a new screenshot."
+            false
           )
+        );
+    } catch (error) {
+      primaryError =
+        error;
+
+      console.error(
+        "[GEMINI PRIMARY]",
+        error &&
+        error.message
+          ? error.message
+          : error
+      );
+    }
+
+
+    // --------------------------------------------------------
+    // RECOVERY
+    // --------------------------------------------------------
+
+    if (!output) {
+      try {
+        output =
+          await callGemini(
+            apiKey,
+            image,
+            buildPrompt(
+              goal,
+              info,
+              rules,
+              history,
+              true
+            )
+          );
+      } catch (error) {
+        console.error(
+          "[GEMINI RECOVERY]",
+          error &&
+          error.message
+            ? error.message
+            : error
+        );
+
+        // Không để Vercel trả 500.
+        return res
+          .status(200)
+          .json(
+            waitResponse(
+              "Vision temporarily unavailable. Retry with a new screenshot."
+            )
+          );
+      }
+    }
+
+
+    // --------------------------------------------------------
+    // PARSE
+    // --------------------------------------------------------
+
+    var model =
+      parseModelJSON(
+        output
+      );
+
+
+    // --------------------------------------------------------
+    // Nếu model JSON lỗi:
+    // recovery thêm một lần
+    // --------------------------------------------------------
+
+    if (!model) {
+      try {
+        var recoveryOutput =
+          await callGemini(
+            apiKey,
+            image,
+            buildPrompt(
+              goal,
+              info,
+              rules,
+              history,
+              true
+            )
+          );
+
+        model =
+          parseModelJSON(
+            recoveryOutput
+          );
+      } catch (error) {
+        console.error(
+          "[JSON RECOVERY]",
+          error &&
+          error.message
+            ? error.message
+            : error
         );
       }
     }
 
-    // --------------------------------------------------------
-    // NORMALIZE
-    // --------------------------------------------------------
-
-    const result =
-      normalizeModelResponse(
-        rawResult
-      );
 
     // --------------------------------------------------------
-    // Nếu model response không chuẩn:
-    // KHÔNG trả success:false.
-    //
-    // Đây chính là phần sửa lỗi trong ảnh.
+    // Không parse được
     // --------------------------------------------------------
 
-    if (!result) {
-      return res.status(200).json(
-        waitResponse(
-          "Vision result was incomplete. Rechecking the current screen."
-        )
-      );
+    if (!model) {
+      return res
+        .status(200)
+        .json(
+          waitResponse(
+            "AI response chưa hợp lệ. Chụp lại và phân tích lại."
+          )
+        );
     }
 
+
     // --------------------------------------------------------
-    // FORCE SAFE WAIT TO BE SUCCESSFUL
+    // ACTION
+    // --------------------------------------------------------
+
+    var action =
+      normalizeAction(
+        model.action
+      );
+
+
+    // --------------------------------------------------------
+    // MODEL đôi khi trả decision = wait
     // --------------------------------------------------------
 
     if (
-      result.action &&
-      result.action.type === "wait"
+      !action &&
+      model.decision
     ) {
-      result.success = true;
-      result.transient = false;
+      var decision =
+        str(
+          model.decision,
+          300
+        ).toLowerCase();
 
-      if (!result.state) {
-        result.state = "waiting";
-      }
-
-      if (!result.decision) {
-        result.decision =
-          "Wait and observe";
+      if (
+        decision.indexOf(
+          "wait"
+        ) !== -1 ||
+        decision.indexOf(
+          "observe"
+        ) !== -1 ||
+        decision.indexOf(
+          "chờ"
+        ) !== -1 ||
+        decision.indexOf(
+          "quan sát"
+        ) !== -1
+      ) {
+        action = {
+          type: "wait",
+          ms: 1200,
+        };
       }
     }
+
+
+    // --------------------------------------------------------
+    // Không có action
+    // --------------------------------------------------------
+
+    if (!action) {
+      return res
+        .status(200)
+        .json(
+          waitResponse(
+            "Không tìm thấy action an toàn. Quan sát lại."
+          )
+        );
+    }
+
+
+    // --------------------------------------------------------
+    // RESPONSE
+    // --------------------------------------------------------
+
+    var confidence =
+      Number(
+        model.confidence
+      );
+
+    if (!isFinite(confidence)) {
+      confidence = 0.5;
+    }
+
+    confidence =
+      Math.max(
+        0,
+        Math.min(
+          1,
+          confidence
+        )
+      );
+
+
+    var result = {
+      success: true,
+
+      transient: false,
+
+      state:
+        str(
+          model.state,
+          100
+        ) ||
+        "observed",
+
+      confidence:
+        confidence,
+
+      observations:
+        arr(
+          model.observations,
+          12
+        ),
+
+      diagnosis:
+        str(
+          model.diagnosis,
+          1000
+        ) ||
+        "Vision analysis completed.",
+
+      decision:
+        str(
+          model.decision,
+          500
+        ) ||
+        "Execute next action.",
+
+      action:
+        action,
+
+      reason:
+        str(
+          model.reason,
+          1000
+        ) ||
+        "Next UI action selected.",
+    };
+
+
+    // --------------------------------------------------------
+    // WAIT
+    // --------------------------------------------------------
+
+    if (
+      action.type ===
+      "wait"
+    ) {
+      result.success = true;
+      result.state =
+        "waiting";
+      result.decision =
+        "Wait and observe";
+    }
+
 
     // --------------------------------------------------------
     // DONE
     // --------------------------------------------------------
 
     if (
-      result.action &&
-      result.action.type === "done"
+      action.type ===
+      "done"
     ) {
       result.success = true;
-      result.transient = false;
-      result.state = "done";
-      result.decision = "Completed";
-
-      return res.status(200).json(
-        result
-      );
+      result.state =
+        "done";
+      result.decision =
+        "Completed";
     }
 
-    // --------------------------------------------------------
-    // FAIL DO AI CHỌN
-    // --------------------------------------------------------
-
-    if (
-      result.action &&
-      result.action.type === "fail"
-    ) {
-      result.success = true;
-      result.transient = false;
-      result.state = "failed";
-
-      return res.status(200).json(
-        result
-      );
-    }
 
     // --------------------------------------------------------
-    // NORMAL ACTION
+    // RETURN
     // --------------------------------------------------------
 
-    result.success = true;
-    result.transient = false;
-
-    return res.status(200).json(
-      result
-    );
+    return res
+      .status(200)
+      .json(result);
 
   } catch (error) {
-    // --------------------------------------------------------
-    // Tuyệt đối không làm API chết chỉ vì exception.
-    // --------------------------------------------------------
+    // ========================================================
+    // QUAN TRỌNG:
+    // Tuyệt đối không để exception biến thành FUNCTION
+    // INVOCATION FAILED nếu handler đã được load.
+    // ========================================================
 
     console.error(
-      "[ANALYZE ERROR]",
-      error?.message || error
+      "[ANALYZE FATAL]",
+      error &&
+      error.stack
+        ? error.stack
+        : error
     );
 
-    return res.status(200).json(
-      waitResponse(
-        "Temporary analysis error. Taking another screenshot."
-      )
-    );
+    return res
+      .status(200)
+      .json(
+        waitResponse(
+          "Temporary server exception. Retry screenshot."
+        )
+      );
   }
 }
