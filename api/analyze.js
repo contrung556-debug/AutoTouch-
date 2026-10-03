@@ -20,6 +20,8 @@
 //   - Cho phép nhập lại mật khẩu khi Gemini báo state = "error".
 //   - Ngân sách thời gian tổng cho các lần gọi Gemini.
 //   - Tùy chọn khóa bí mật: đặt ANALYZE_SECRET và gửi header x-api-secret.
+//   - Gemini API key do AutoTouch gửi lên qua header x-gemini-key
+//     (fallback: biến môi trường GEMINI_API_KEY / GOOGLE_API_KEY).
 // ============================================================
 
 import crypto from "crypto";
@@ -38,7 +40,8 @@ export const config = {
 
 const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 const RECOVERY_MODEL = process.env.GEMINI_RECOVERY_MODEL || DEFAULT_MODEL;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
+// Chỉ là fallback: key chính do AutoTouch gửi qua header x-gemini-key.
+const ENV_GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
 const ANALYZE_SECRET = process.env.ANALYZE_SECRET || "";
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
@@ -1092,9 +1095,9 @@ Return ONLY JSON.
 // GEMINI
 // ============================================================
 
-async function callGemini({ image, prompt, model, timeoutMs }) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("Missing GEMINI_API_KEY");
+async function callGemini({ image, prompt, model, timeoutMs, apiKey }) {
+  if (!apiKey) {
+    throw new Error("Missing Gemini API key");
   }
 
   const imageString = String(image || "");
@@ -1125,7 +1128,7 @@ async function callGemini({ image, prompt, model, timeoutMs }) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY,
+          "x-goog-api-key": apiKey,
         },
         signal: controller.signal,
         body: JSON.stringify({
@@ -1255,6 +1258,24 @@ export default async function handler(req, res) {
     const width = Number(body.width ?? body.screenWidth ?? 375) || 375;
     const height = Number(body.height ?? body.screenHeight ?? 812) || 812;
 
+    // Gemini key do AutoTouch gửi lên (header ưu tiên), fallback về env.
+    const geminiKey = String(
+      req.headers["x-gemini-key"] || body.geminiKey || ENV_GEMINI_API_KEY || ""
+    ).trim();
+
+    if (!geminiKey) {
+      return reply(
+        {
+          ...fallbackAction("Missing Gemini API key. Set GEMINI_KEY in the AutoTouch script."),
+          action: "fail",
+          purpose: "config",
+        },
+        { success: false, validationErrors: ["MISSING_GEMINI_KEY"] },
+        width,
+        height
+      );
+    }
+
     if (!image) {
       return reply(
         fallbackAction("Missing screenshot image.", { transient: true }),
@@ -1297,6 +1318,7 @@ export default async function handler(req, res) {
 
       try {
         const raw = await callGemini({
+          apiKey: geminiKey,
           image,
           prompt,
           model: attempt === 0 ? DEFAULT_MODEL : RECOVERY_MODEL,
