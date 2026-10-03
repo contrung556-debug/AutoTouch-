@@ -1,1423 +1,3261 @@
 // ============================================================
-// pages/api/analyze.js
-// AUTOTOUCH VISION AGENT - BRAIN 6.4
+// AUTOTOUCH AGENT - FULL VERSION
+// Password chỉ nhập 1 lần
 //
-// Hợp đồng với client AutoTouch (giữ nguyên như 6.3):
-//   - action luôn là string ở cấp trên cùng
-//   - tap:   x, y (pixel)
-//   - type:  text
-//   - wait:  ms + wait (cả hai)
-//   - swipe: start/end + x1,y1,x2,y2 (pixel)
-//   - wheel: x, y (pixel), rows (0..1000, KHÔNG đổi sang pixel)
-//   - plan:  steps (tap pixel / type)
-//
-// Thay đổi so với 6.3:
-//   - Tọa độ thiếu => null => validation bắt được (không còn tap 0,0).
-//   - Kiểm tra INFO theo GIÁ TRỊ (không phải JSON), chuẩn hóa NFC,
-//     gõ lại đúng giá trị gốc của INFO.
-//   - Loop guard: giới hạn restart/launch luôn áp dụng; ngưỡng wait
-//     riêng cho incoming_call / loading, chỉ áp cho action wait.
-//   - Cho phép nhập lại mật khẩu khi Gemini báo state = "error".
-//   - Ngân sách thời gian tổng cho các lần gọi Gemini.
-//   - Tùy chọn khóa bí mật: đặt ANALYZE_SECRET và gửi header x-api-secret.
-//   - Gemini API key do AutoTouch gửi lên qua header x-gemini-key
-//     (fallback: biến môi trường GEMINI_API_KEY / GOOGLE_API_KEY).
+// Integrated:
+// - Supabase Họ/Tên
+// - Random phone
+// - Random password
+// - Vision agent
+// - Plan tap/type
+// - Wheel date picker
+// - QWERTY + Numpad
+// - Password mixed letters/numbers
+// - Jitter tap
+// - Password guard: KHÔNG NHẬP LẠI
 // ============================================================
 
-import crypto from "crypto";
+const { exec, usleep, touchDown, touchMove, touchUp } = at;
+
 
 // ============================================================
-// CONFIG
+// BASIC UTILS
 // ============================================================
 
-export const config = {
-  api: {
-    bodyParser: {
-      sizeLimit: "4.5mb",
-    },
-  },
-};
+function wait(ms) {
+    ms = Number(ms) || 0;
 
-const DEFAULT_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
-const RECOVERY_MODEL = process.env.GEMINI_RECOVERY_MODEL || DEFAULT_MODEL;
-// Chỉ là fallback: key chính do AutoTouch gửi qua header x-gemini-key.
-const ENV_GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
-const ANALYZE_SECRET = process.env.ANALYZE_SECRET || "";
+    if (ms > 0) {
+        usleep(Math.round(ms * 1000));
+    }
+}
 
-const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+function safeString(value) {
+    return String(value == null ? "" : value);
+}
 
-const ATTEMPTS = 2;
-const TIMEOUT_MS = 22000;
-// Tổng thời gian tối đa cho mọi lần gọi Gemini (chỉnh theo giới hạn hosting).
-const TOTAL_BUDGET_MS = Number(process.env.ANALYZE_BUDGET_MS) || 50000;
-const MIN_RETRY_MS = 5000;
+function isFiniteNumber(v) {
+    return typeof v === "number" && isFinite(v);
+}
 
-const MAX_PLAN_STEPS = 6;
-const MAX_WHEEL_ROWS = 40;
-const MAX_HISTORY = 30;
-const MAX_OBSERVATIONS = 8;
+function clampNumber(v, min, max) {
+    if (v < min) return min;
+    if (v > max) return max;
+    return v;
+}
 
-const MAX_CONSECUTIVE_WAITS = 5;
-const MAX_LOADING_WAITS = 12;
-const MAX_CALL_WAITS = 20;
-const MAX_RESTARTS = 2;
-const MAX_LAUNCHES = 3;
 
-const MIN_CONFIDENCE = 0.45;
+// ============================================================
+// SERVER & GOAL
+// ============================================================
 
-const ACTIONS = [
-  "tap", "swipe", "type", "wait", "wheel",
-  "plan", "launch", "restart", "done", "fail",
+const SERVER_URL =
+    "https://apigemini-azure.vercel.app/api/analyze";
+
+const GOAL =
+    "Hoàn thành màn hình đăng ký hiện tại và chuyển sang bước tiếp theo.";
+
+
+// ============================================================
+// SUPABASE
+// ============================================================
+
+const SUPABASE_URL =
+    "https://hopvaedxefekmojrqdzw.supabase.co";
+
+// Giữ key hiện tại của bạn tại đây.
+// Không log key ra console.
+const SUPABASE_KEY =
+    "THAY_SUPABASE_KEY_CUA_BAN";
+
+const TABLE_NAME = "ho_ten";
+
+
+// ============================================================
+// TEST PHONE
+// ============================================================
+
+const TEST_PHONE = "";
+
+const PHONE_WITHOUT_LEADING_ZERO = false;
+
+const PHONE_PREFIXES = [
+    "097",
+    "086"
 ];
 
-const PLAN_ACTIONS = ["tap", "type"];
+function randomPhoneForTest() {
 
-const STATES = [
-  "welcome", "create_account", "login", "meta", "name", "birthday",
-  "phone", "password", "captcha", "otp", "verification", "overlay",
-  "incoming_call", "external_app", "home_screen", "loading", "error",
-  "device_lock", "stuck", "success", "home", "unknown",
-];
+    const prefix =
+        PHONE_PREFIXES[
+            Math.floor(
+                Math.random() *
+                PHONE_PREFIXES.length
+            )
+        ];
 
-// ============================================================
-// SYSTEM RULES
-// ============================================================
+    let rest = "";
 
-const SYSTEM_RULES = `
-You are the reasoning brain of an iOS visual automation agent.
-
-Your job is to understand the current screenshot and choose the safest
-useful next action. The automation is CLOSED LOOP:
-OBSERVE -> UNDERSTAND -> DIAGNOSE -> DECIDE -> ACT -> VERIFY -> OBSERVE AGAIN
-
-LANGUAGE
-- The target app may be Vietnamese, English, Chinese, Korean, Japanese or other.
-- Read the real UI text from the screenshot. Do not assume English.
-- Never translate or transliterate user data. If INFO has familyName "Phạm"
-  and givenName "Thu Hà", type exactly "Phạm" and "Thu Hà", never "Pham"/"Thu Ha".
-
-VISUAL REASONING
-- The screenshot is the primary source of truth.
-- Consider text, buttons, fields, keyboard, dialogs, overlays, navigation,
-  loading indicators, errors, selected controls, and whether the previous
-  action worked or the goal is already complete.
-- Do not rely only on keywords or fixed coordinates.
-
-COORDINATES
-- Output coordinates in normalized 0..1000 space (0,0 top-left; 1000,1000 bottom-right).
-- Never output pixel coordinates.
-- ALWAYS include x and y for tap; never omit them.
-- wheel.rows stay normalized 0..1000.
-
-SCREEN CHANGES
-- Coordinates are valid only for the screenshot they came from.
-- If the UI changed, discard old coordinates and observe again.
-
-INTERRUPTIONS
-- Incoming call: do NOT answer or reject automatically. Wait.
-- Another app visible, or Home Screen: use launch to recover the target app.
-- Overlay blocking the UI: interact only if its purpose is visually clear, else wait.
-
-LOADING
-- If loading, wait. Long loading can be normal. Only use stuck/fail after
-  repeated identical observations and enough evidence.
-
-UNKNOWN SCREENS
-- Unknown does not mean failure. Use screenshot, goal, INFO, rules, history
-  and the previous action to choose the safest next step. When confidence
-  is low, prefer wait.
-
-ACTION LIFECYCLE
-- History statuses: proposed, executed, verified, failed, unknown.
-- proposed != executed != verified. Only verified proves completion.
-- A plan is only a proposal. Never assume plan = executed/submitted/verified.
-
-PASSWORD
-- Must exactly match INFO. Never invent, translate or modify it.
-- Do not enter it again after it was VERIFIED, unless the screen shows the
-  app rejected it (then report state "error").
-- An empty password field after submission does not mean it failed.
-  Use history + screenshot + expected result.
-
-NAME
-- Name values must come exactly from INFO. Family/given name may appear in
-  either field order; use the screenshot to decide.
-
-PLANS
-- Use a plan only for several immediate operations on the SAME stable screen.
-- Never plan across an unknown future screen. If navigation is expected,
-  act once and observe again.
-
-GOAL
-- Always make progress toward GOAL. No unnecessary actions. No restart
-  without evidence. Do not fail merely because wording differs.
-
-OUTPUT
-Return ONLY valid JSON with:
-{
-  "state": "...",
-  "confidence": 0.0,
-  "observations": [],
-  "diagnosis": "...",
-  "decision": "...",
-  "expected_result": "...",
-  "action": "tap|swipe|type|wait|wheel|plan|launch|restart|done|fail"
-}
-
-Tap:    { "action": "tap", "x": 0, "y": 0 }
-Type:   { "action": "type", "text": "exact INFO value" }
-Swipe:  { "action": "swipe", "start": {"x":0,"y":0}, "end": {"x":0,"y":0}, "duration": 500 }
-Wait:   { "action": "wait", "ms": 800 }
-Wheel:  { "action": "wheel", "x": 0, "y": 0, "rows": [ {"x":0,"y":0,"delta":1} ] }
-Plan:   { "action": "plan", "purpose": "name", "steps": [
-          {"action":"tap","x":0,"y":0}, {"action":"type","text":"exact INFO value"} ] }
-
-Never put an action object inside the action field.
-`;
-
-// ============================================================
-// HELPERS
-// ============================================================
-
-// Trả null nếu không phải số hữu hạn (KHÔNG fallback về 0).
-function coord(value) {
-  if (value === null || value === undefined || value === "") {
-    return null;
-  }
-
-  const n = Number(value);
-
-  if (!Number.isFinite(n)) {
-    return null;
-  }
-
-  return Math.max(0, Math.min(1000, n));
-}
-
-function clampNumber(value, min, max, fallback = 0) {
-  const n = Number(value);
-
-  if (!Number.isFinite(n)) {
-    return fallback;
-  }
-
-  return Math.max(min, Math.min(max, n));
-}
-
-function cleanObservation(value) {
-  if (value == null) {
-    return "";
-  }
-
-  return String(value).replace(/\s+/g, " ").trim().slice(0, 500);
-}
-
-function cleanState(value) {
-  const state = String(value || "unknown").trim().toLowerCase();
-
-  return STATES.includes(state) ? state : "unknown";
-}
-
-function cleanAction(value) {
-  const action = String(value || "").trim().toLowerCase();
-
-  return ACTIONS.includes(action) ? action : "";
-}
-
-function normalizeStatus(value) {
-  const status = String(value || "").trim().toLowerCase();
-
-  return ["proposed", "executed", "verified", "failed"].includes(status)
-    ? status
-    : "unknown";
-}
-
-function nfc(value) {
-  return String(value ?? "").normalize("NFC");
-}
-
-function parseJsonLoose(text) {
-  if (!text) {
-    throw new Error("Empty Gemini response");
-  }
-
-  const value = String(text)
-    .trim()
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/\s*```$/i, "")
-    .trim();
-
-  try {
-    return JSON.parse(value);
-  } catch (_) {
-    const first = value.indexOf("{");
-    const last = value.lastIndexOf("}");
-
-    if (first >= 0 && last > first) {
-      return JSON.parse(value.slice(first, last + 1));
+    for (let i = 0; i < 7; i++) {
+        rest += Math.floor(
+            Math.random() * 10
+        );
     }
 
-    throw new Error("Invalid JSON from Gemini");
-  }
+    const full =
+        prefix + rest;
+
+    return PHONE_WITHOUT_LEADING_ZERO
+        ? full.substring(1)
+        : full;
 }
+
+function getPhone() {
+
+    const configured =
+        safeString(TEST_PHONE).trim();
+
+    return configured ||
+        randomPhoneForTest();
+}
+
+
+// ============================================================
+// RANDOM PASSWORD
+// ============================================================
+
+const PASSWORD_LENGTH = 12;
+
+function randomPassword(length) {
+
+    length =
+        Number(length) ||
+        PASSWORD_LENGTH;
+
+    const upper =
+        "ABCDEFGHJKLMNPQRSTUVWXYZ";
+
+    const lower =
+        "abcdefghijkmnopqrstuvwxyz";
+
+    const digits =
+        "23456789";
+
+    const all =
+        upper +
+        lower +
+        digits;
+
+    let password = "";
+
+    // Ít nhất 1 hoa
+    password +=
+        upper[
+            Math.floor(
+                Math.random() *
+                upper.length
+            )
+        ];
+
+    // Ít nhất 1 thường
+    password +=
+        lower[
+            Math.floor(
+                Math.random() *
+                lower.length
+            )
+        ];
+
+    // Ít nhất 1 số
+    password +=
+        digits[
+            Math.floor(
+                Math.random() *
+                digits.length
+            )
+        ];
+
+    while (
+        password.length <
+        length
+    ) {
+
+        password +=
+            all[
+                Math.floor(
+                    Math.random() *
+                    all.length
+                )
+            ];
+    }
+
+    const chars =
+        password.split("");
+
+    for (
+        let i = chars.length - 1;
+        i > 0;
+        i--
+    ) {
+
+        const j =
+            Math.floor(
+                Math.random() *
+                (i + 1)
+            );
+
+        const tmp =
+            chars[i];
+
+        chars[i] =
+            chars[j];
+
+        chars[j] =
+            tmp;
+    }
+
+    return chars.join("");
+}
+
+function getPassword() {
+    return randomPassword(
+        PASSWORD_LENGTH
+    );
+}
+
+
+// ============================================================
+// SUPABASE NAME
+// ============================================================
+
+function splitHoTen(fullName) {
+
+    const parts =
+        safeString(fullName)
+            .trim()
+            .split(/\s+/);
+
+    return {
+
+        ho:
+            parts[0] || "",
+
+        ten:
+            parts
+                .slice(1)
+                .join(" ") || ""
+    };
+}
+
+function supabaseHeaders() {
+
+    return (
+        ' -H "apikey: ' +
+        SUPABASE_KEY +
+        '"' +
+
+        ' -H "Authorization: Bearer ' +
+        SUPABASE_KEY +
+        '"'
+    );
+}
+
+function getUnusedName() {
+
+    if (
+        !SUPABASE_KEY ||
+        SUPABASE_KEY ===
+            "THAY_SUPABASE_KEY_CUA_BAN"
+    ) {
+
+        throw new Error(
+            "SUPABASE_KEY chưa được cấu hình."
+        );
+    }
+
+    const getUrl =
+        SUPABASE_URL +
+        "/rest/v1/" +
+        TABLE_NAME +
+        "?select=id,ho_ten" +
+        "&da_dung=eq.false" +
+        "&limit=1";
+
+    const getCmd =
+        'curl -sS -m 30 "' +
+        getUrl +
+        '"' +
+        supabaseHeaders();
+
+    const raw =
+        exec(getCmd);
+
+    console.log(
+        "[Supabase GET] " +
+        safeString(raw)
+            .substring(0, 500)
+    );
+
+    let rows;
+
+    try {
+
+        rows =
+            JSON.parse(raw);
+
+    } catch (e) {
+
+        throw new Error(
+            "Supabase trả JSON không hợp lệ: " +
+            safeString(raw)
+                .substring(0, 300)
+        );
+    }
+
+    if (
+        !Array.isArray(rows) ||
+        rows.length === 0
+    ) {
+
+        throw new Error(
+            "Không còn Họ Tên chưa dùng."
+        );
+    }
+
+    const row =
+        rows[0];
+
+    if (
+        !row ||
+        !row.id ||
+        !row.ho_ten
+    ) {
+
+        throw new Error(
+            "Dòng Supabase không có id/ho_ten hợp lệ."
+        );
+    }
+
+    return {
+
+        id:
+            row.id,
+
+        ho_ten:
+            safeString(row.ho_ten),
+
+        ...splitHoTen(
+            row.ho_ten
+        )
+    };
+}
+
+function markNameUsed(rowId) {
+
+    if (!rowId) {
+
+        throw new Error(
+            "Thiếu rowId khi mark name."
+        );
+    }
+
+    const patchUrl =
+        SUPABASE_URL +
+        "/rest/v1/" +
+        TABLE_NAME +
+        "?id=eq." +
+        encodeURIComponent(rowId);
+
+    const patchCmd =
+        'curl -sS -m 30 -X PATCH "' +
+        patchUrl +
+        '"' +
+        supabaseHeaders() +
+
+        ' -H "Content-Type: application/json"' +
+
+        ' -H "Prefer: return=minimal"' +
+
+        ' -d \'{"da_dung":true}\'';
+
+    const raw =
+        exec(patchCmd);
+
+    console.log(
+        "[Supabase PATCH] " +
+        safeString(raw)
+            .substring(0, 300)
+    );
+}
+
 
 // ============================================================
 // INFO
 // ============================================================
 
-function getInfoObject(info) {
-  if (!info) {
-    return {};
-  }
+let INFO = "";
 
-  if (typeof info === "object") {
-    return info;
-  }
-
-  try {
-    const parsed = JSON.parse(String(info));
-
-    if (parsed && typeof parsed === "object") {
-      return parsed;
-    }
-  } catch (_) {}
-
-  return { raw: String(info) };
-}
-
-// Chỉ lấy GIÁ TRỊ (không lấy tên key).
-function collectInfoValues(node, out = [], depth = 0) {
-  if (node == null || depth > 5) {
-    return out;
-  }
-
-  if (
-    typeof node === "string" ||
-    typeof node === "number" ||
-    typeof node === "boolean"
-  ) {
-    out.push(String(node));
-  } else if (Array.isArray(node)) {
-    node.forEach((v) => collectInfoValues(v, out, depth + 1));
-  } else if (typeof node === "object") {
-    Object.values(node).forEach((v) => collectInfoValues(v, out, depth + 1));
-  }
-
-  return out;
-}
-
-function infoValues(info) {
-  return collectInfoValues(getInfoObject(info)).filter((v) => v.length > 0);
-}
-
-// Text hợp lệ nếu bằng một giá trị INFO (sau NFC) hoặc là đoạn con của một giá trị.
-function infoAllows(info, text) {
-  if (text == null || String(text).length === 0) {
-    return false;
-  }
-
-  const target = nfc(text);
-
-  return infoValues(info).some((v) => nfc(v).includes(target));
-}
-
-// Nếu text khớp CHÍNH XÁC một giá trị INFO (sau NFC), trả về giá trị gốc.
-function canonicalText(info, text) {
-  const target = nfc(text);
-  const exact = infoValues(info).find((v) => nfc(v) === target);
-
-  return exact !== undefined ? exact : String(text);
-}
-
-function pick(obj, keys) {
-  for (const key of keys) {
-    if (obj[key] !== undefined && obj[key] !== null) {
-      return String(obj[key]);
-    }
-  }
-
-  return "";
-}
-
-function getNameInfo(info) {
-  const obj = getInfoObject(info);
-
-  return {
-    familyName: pick(obj, ["ho", "họ", "familyName", "lastName", "last_name", "surname"]),
-    givenName: pick(obj, ["ten", "tên", "givenName", "firstName", "first_name"]),
-  };
-}
-
-function getPassword(info) {
-  return pick(getInfoObject(info), ["password", "matKhau", "mật khẩu"]);
-}
-
-function serializeInfo(info) {
-  try {
-    return JSON.stringify(info ?? {});
-  } catch (_) {
-    return String(info ?? "");
-  }
-}
 
 // ============================================================
-// HISTORY
+// PASSWORD STATE
+// ============================================================
+//
+// QUAN TRỌNG:
+//
+// passwordTyped = true ngay sau khi client thực sự type
+// đúng password.
+//
+// Sau đó:
+// - AI yêu cầu type password lần nữa -> KHÔNG TYPE.
+// - Plan yêu cầu type password lần nữa -> KHÔNG TYPE.
+// - Screenshot password bị mask/trống -> KHÔNG TYPE LẠI.
+//
 // ============================================================
 
-function normalizeHistory(history) {
-  if (!Array.isArray(history)) {
-    return [];
-  }
+let passwordTyped = false;
 
-  return history.slice(-MAX_HISTORY).map((item, index) => {
-    let status = normalizeStatus(item?.status);
-
-    // success:true => verified, success:false => failed,
-    // plan không có trạng thái => chỉ là proposed.
-    if (item?.success === true) {
-      status = "verified";
-    } else if (item?.success === false) {
-      status = "failed";
-    } else if (status === "unknown" && item?.action === "plan") {
-      status = "proposed";
-    }
-
-    return {
-      id: item?.id ?? item?.transaction_id ?? item?.transactionId ?? `history_${index}`,
-      state: cleanState(item?.state),
-      action: cleanAction(item?.action),
-      status,
-      purpose: String(item?.purpose || "").trim().toLowerCase().slice(0, 100),
-      text: item?.text == null ? "" : String(item.text).slice(0, 500),
-      success: typeof item?.success === "boolean" ? item.success : null,
-      reason: item?.reason == null ? "" : String(item.reason).slice(0, 500),
-      expected_result:
-        item?.expected_result == null ? "" : String(item.expected_result).slice(0, 500),
-      timestamp: item?.timestamp ?? item?.time ?? null,
-    };
-  });
-}
-
-function analyzeHistory(history) {
-  const items = normalizeHistory(history);
-
-  let passwordSubmitted = false;
-  let nameSubmitted = false;
-  let phoneSubmitted = false;
-
-  let lastAction = "";
-  let lastState = "unknown";
-  let lastOutcome = "unknown";
-
-  let totalWaits = 0;
-  let consecutiveWaits = 0;
-  let restartCount = 0;
-  let launchCount = 0;
-
-  let lastTransaction = null;
-
-  for (const item of items) {
-    // Action lạ/không rõ không làm reset chuỗi wait.
-    if (item.action) {
-      lastAction = item.action;
-    }
-
-    lastState = item.state;
-    lastOutcome = item.status;
-
-    if (item.action === "wait") {
-      totalWaits += 1;
-      consecutiveWaits += 1;
-    } else if (item.action) {
-      consecutiveWaits = 0;
-    }
-
-    // Restart = phiên mới.
-    if (item.action === "restart") {
-      restartCount += 1;
-      passwordSubmitted = false;
-      nameSubmitted = false;
-      phoneSubmitted = false;
-      consecutiveWaits = 0;
-
-      lastTransaction = {
-        id: item.id,
-        purpose: "restart",
-        action: "restart",
-        status: item.status,
-      };
-
-      continue;
-    }
-
-    if (item.action === "launch") {
-      launchCount += 1;
-    }
-
-    // Chỉ "verified" mới chứng minh đã hoàn tất.
-    if (item.purpose === "password" && item.status === "verified") {
-      passwordSubmitted = true;
-    }
-
-    if (item.purpose === "name" && item.status === "verified") {
-      nameSubmitted = true;
-    }
-
-    if (item.purpose === "phone" && item.status === "verified") {
-      phoneSubmitted = true;
-    }
-
-    lastTransaction = {
-      id: item.id,
-      purpose: item.purpose,
-      action: item.action,
-      status: item.status,
-      success: item.success,
-      expected_result: item.expected_result,
-    };
-  }
-
-  return {
-    passwordSubmitted,
-    nameSubmitted,
-    phoneSubmitted,
-    lastAction,
-    lastState,
-    lastOutcome,
-    totalWaits,
-    consecutiveWaits,
-    restartCount,
-    launchCount,
-    lastTransaction,
-  };
-}
 
 // ============================================================
-// NORMALIZE GEMINI OUTPUT (hệ 0..1000, thiếu tọa độ => null)
+// RULES
 // ============================================================
 
-function normalizeBrain(raw) {
-  const brain = raw && typeof raw === "object" ? raw : {};
+const RULES = [
 
-  const result = {
-    state: cleanState(brain.state),
-    confidence: clampNumber(brain.confidence, 0, 1, 0),
-    observations: Array.isArray(brain.observations)
-      ? brain.observations
-          .map(cleanObservation)
-          .filter(Boolean)
-          .slice(0, MAX_OBSERVATIONS)
-      : [],
-    diagnosis: cleanObservation(brain.diagnosis),
-    decision: cleanObservation(brain.decision),
-    expected_result: cleanObservation(brain.expected_result),
-    action: cleanAction(brain.action) || "wait",
-    purpose: String(brain.purpose || "").trim().toLowerCase().slice(0, 100),
-    reason: cleanObservation(brain.reason),
-    wait: clampNumber(brain.ms ?? brain.wait, 100, 10000, 800),
-  };
+    "Không bấm vào quảng cáo.",
 
-  if (result.action === "tap") {
-    result.x = coord(brain.x);
-    result.y = coord(brain.y);
-  }
+    "Không bấm vào banner quảng cáo.",
 
-  if (result.action === "type") {
-    result.text = brain.text == null ? "" : String(brain.text);
-  }
+    "Không bấm vào liên kết có dấu hiệu mở website hoặc ứng dụng bên ngoài.",
 
-  if (result.action === "swipe") {
-    const start = brain.start || {};
-    const end = brain.end || {};
+    "Không thao tác với nội dung không liên quan đến mục tiêu đăng ký.",
 
-    result.start = {
-      x: coord(start.x ?? brain.x1),
-      y: coord(start.y ?? brain.y1),
-    };
+    "Chỉ thao tác với phần giao diện cần thiết để hoàn thành GOAL.",
 
-    result.end = {
-      x: coord(end.x ?? brain.x2),
-      y: coord(end.y ?? brain.y2),
-    };
 
-    result.duration = clampNumber(brain.duration, 100, 5000, 500);
-  }
+    // --------------------------------------------------------
+    // LOADING
+    // --------------------------------------------------------
 
-  if (result.action === "wheel") {
-    result.x = coord(brain.x);
-    result.y = coord(brain.y);
+    "LOADING / SPINNER:",
 
-    result.rows = Array.isArray(brain.rows)
-      ? brain.rows.slice(0, MAX_WHEEL_ROWS).map((row) => ({
-          x: coord(row?.x),
-          y: coord(row?.y),
-          delta: clampNumber(row?.delta, -1000, 1000, 0),
-        }))
-      : [];
-  }
+    "- Nếu button đang hiển thị spinner/loading indicator thay cho chữ, không coi spinner là text target.",
 
-  if (result.action === "plan") {
-    result.steps = Array.isArray(brain.steps)
-      ? brain.steps
-          .slice(0, MAX_PLAN_STEPS)
-          .map((step) => {
-            const action = cleanAction(step?.action);
-            const out = { action };
+    "- Không click lại button đang ở trạng thái loading.",
 
-            if (action === "tap") {
-              out.x = coord(step?.x);
-              out.y = coord(step?.y);
-            }
+    "- Nếu màn hình đang loading rõ ràng, ưu tiên action wait.",
 
-            if (action === "type") {
-              out.text = step?.text == null ? "" : String(step.text);
-            }
+    "- Không suy đoán button loading là button có thể bấm.",
 
-            return out;
-          })
-          .filter((step) => PLAN_ACTIONS.includes(step.action))
-      : [];
-  }
+    "- Chỉ thao tác khi có thể xác định rõ button đang ở trạng thái có thể bấm.",
 
-  return result;
+
+    // --------------------------------------------------------
+    // INPUT
+    // --------------------------------------------------------
+
+    "INPUT ĐÃ CÓ GIÁ TRỊ:",
+
+    "- Nếu ô nhập đã chứa đúng dữ liệu mục tiêu thì KHÔNG type lại.",
+
+    "- Không xóa rồi nhập lại input đã đúng nếu không cần.",
+
+    "- Nếu input đang chứa một phần dữ liệu thì quan sát kỹ trước khi sửa.",
+
+    "- Không tự thay đổi dữ liệu được phép dùng.",
+
+
+    // --------------------------------------------------------
+    // DATE WHEEL
+    // --------------------------------------------------------
+
+    "NGÀY SINH DẠNG BÁNH XE:",
+
+    "- Không dùng tap hoặc type để chọn ngày/tháng/năm.",
+
+    "- Chỉ dùng action wheel.",
+
+    "- Mỗi action wheel chỉ chỉnh MỘT cột.",
+
+    "- Thứ tự ưu tiên: năm trước, tháng sau, ngày cuối.",
+
+    "- Giá trị đang chọn là dòng ở giữa/nền đậm.",
+
+    "- So sánh giá trị hiện tại với ngày sinh trong INFO.",
+
+    "- rows > 0 nghĩa là tăng giá trị.",
+
+    "- rows < 0 nghĩa là giảm giá trị.",
+
+    "- Sau mỗi wheel phải quan sát ảnh mới.",
+
+    "- Không chỉnh cột tiếp theo khi cột hiện tại chưa xác nhận đúng.",
+
+    "- Không tự bấm Tiếp khi ngày tháng năm chưa xác nhận đúng.",
+
+
+    // --------------------------------------------------------
+    // MULTI INPUT
+    // --------------------------------------------------------
+
+    "MÀN HÌNH NHIỀU Ô NHẬP:",
+
+    "- Khi nhiều ô nhập cùng lúc, ví dụ Họ và Tên, dùng action plan.",
+
+    "- Plan chỉ được chứa tap và type.",
+
+    "- Nếu ô đầu tiên đã focus rõ ràng thì plan có thể bắt đầu bằng type.",
+
+    "- Nếu ô chưa focus thì tap ô trước rồi type.",
+
+    "- Không type rồi type liên tiếp.",
+
+    "- Không tap rồi tap liên tiếp.",
+
+    "- Mỗi ô chỉ điền một lần.",
+
+    "- Không đưa nút Tiếp vào plan.",
+
+    "- Sau plan phải chụp ảnh mới và kiểm tra lại.",
+
+    "- Không type lại ô đã có đúng dữ liệu.",
+
+
+    // --------------------------------------------------------
+    // PHONE
+    // --------------------------------------------------------
+
+    "SỐ DI ĐỘNG:",
+
+    "- Chỉ sử dụng đúng số nằm trong INFO.",
+
+    "- Không tự thay đổi số.",
+
+    "- Không tự thêm hoặc bỏ mã quốc gia.",
+
+    "- Nếu app đã chọn +84 thì tuân theo định dạng INFO.",
+
+    "- Nếu một ô số điện thoại thì có thể tap rồi type.",
+
+    "- Nếu nhiều ô nhập cùng màn hình thì dùng plan.",
+
+    "- Sau khi nhập số phải quan sát ảnh mới.",
+
+    "- Chỉ bấm Tiếp/Gửi mã sau khi xác nhận số đã hiển thị đúng.",
+
+
+    // --------------------------------------------------------
+    // PASSWORD
+    // --------------------------------------------------------
+
+    "MẬT KHẨU - CHỈ NHẬP MỘT LẦN:",
+
+    "- Nếu thấy ô Mật khẩu, Password, Create password hoặc ngữ cảnh rõ ràng là tạo mật khẩu, dùng đúng trường Mật khẩu trong INFO.",
+
+    "- Không tự bịa mật khẩu.",
+
+    "- Không tự sinh mật khẩu khác với INFO.",
+
+    "- Chỉ nhập nguyên văn mật khẩu trong INFO.",
+
+    "- Nếu ô chưa focus thì tap đúng ô rồi type.",
+
+    "- Nếu ô đã focus thì type trực tiếp.",
+
+    "- Nếu ô password hiển thị dấu chấm, dấu sao hoặc nhìn giống trống thì KHÔNG được suy luận rằng password chưa nhập.",
+
+    "- Sau khi client đã nhập đúng password một lần thì KHÔNG nhập lại password.",
+
+    "- Nếu màn hình sau đó vẫn hiển thị ô password bị che thì giữ nguyên trạng thái đã nhập.",
+
+    "- Nếu server yêu cầu lại chính password sau khi đã nhập thì không type lại; phải quan sát màn hình mới và tìm bước tiếp theo.",
+
+    "- Nếu có ô Nhập lại mật khẩu, Confirm password hoặc tương tự, không tự động nhập lần thứ hai chỉ vì ô đang nhìn trống; tuân theo trạng thái password đã nhập và quyết định của server.",
+
+    "- Không lấy mật khẩu từ placeholder.",
+
+    "- Không suy luận mật khẩu từ dấu chấm hoặc dấu sao.",
+
+    "- Nếu INFO không có Mật khẩu thì không được tự tạo mật khẩu.",
+
+    "- Sau khi nhập mật khẩu phải chụp ảnh mới và kiểm tra lại.",
+
+
+    // --------------------------------------------------------
+    // PLAN
+    // --------------------------------------------------------
+
+    "PLAN:",
+
+    "- Chỉ được chứa tap và type.",
+
+    "- Không chứa swipe.",
+
+    "- Không chứa wheel.",
+
+    "- Không chứa wait.",
+
+    "- Không chứa nút Tiếp.",
+
+    "- Không chứa action ngoài danh sách.",
+
+    "- Mỗi vòng quan sát chỉ thực thi một action chính.",
+
+    "- Sau action phải quan sát lại ảnh trước khi quyết định action tiếp theo.",
+
+    "- Nếu password đã nhập thì plan không được type lại password."
+];
+
+
+// ============================================================
+// LIMITS
+// ============================================================
+
+const MAX_STEPS = 30;
+
+const SETTLE_MS = 1200;
+
+const MAX_REPEAT = 3;
+
+const MAX_WAIT_SECONDS = 10;
+
+const MAX_PLAN_STEPS = 8;
+
+const MAX_WHEEL_ROWS = 31;
+
+const PLAN_AFTER_TAP_MS = 600;
+
+const PLAN_AFTER_TYPE_MS = 400;
+
+const WHEEL_STEP_DISTANCE = 83.48;
+
+const WHEEL_STEP_COUNT = 24;
+
+const WHEEL_START_Y = 0;
+
+const TAP_SCREEN_WIDTH = 0;
+
+const TAP_SCREEN_HEIGHT = 0;
+
+const MAX_BASE64_LENGTH = 4000000;
+
+
+// ============================================================
+// FILES & GEMINI KEY
+// ============================================================
+
+const ROOT =
+    String(at.rootDir())
+        .replace(/\/+$/, "");
+
+const SCREENSHOT_PATH =
+    ROOT +
+    "/agent_shot.png";
+
+const PAYLOAD_PATH =
+    ROOT +
+    "/agent_payload.json";
+
+const KEY_FILE =
+    ROOT +
+    "/gemini_key.txt";
+
+function loadKey() {
+
+    try {
+
+        const out =
+            exec(
+                "cat '" +
+                KEY_FILE +
+                "' 2>/dev/null"
+            );
+
+        const key =
+            String(out || "")
+                .trim();
+
+        if (
+            key.length >= 20 &&
+            key.length <= 200 &&
+            /^[A-Za-z0-9_.-]+$/.test(key)
+        ) {
+
+            return key;
+        }
+
+    } catch (e) {}
+
+    return "";
 }
 
-// Gõ lại đúng giá trị gốc trong INFO (tránh lệch NFC/NFD).
-function canonicalizeTyping(brain, info) {
-  if (brain.action === "type" && brain.text) {
-    brain.text = canonicalText(info, brain.text);
-  }
+const GEMINI_API_KEY =
+    loadKey();
 
-  if (brain.action === "plan" && Array.isArray(brain.steps)) {
-    brain.steps = brain.steps.map((step) =>
-      step.action === "type" && step.text
-        ? { ...step, text: canonicalText(info, step.text) }
-        : step
+
+// ============================================================
+// TOUCH / TAP / SWIPE
+// ============================================================
+
+function doTap(x, y) {
+
+    if (
+        !isFiniteNumber(
+            Number(x)
+        ) ||
+        !isFiniteNumber(
+            Number(y)
+        )
+    ) {
+
+        throw new Error(
+            "Tọa độ tap không hợp lệ."
+        );
+    }
+
+    x = Number(x);
+    y = Number(y);
+
+    const jitterX =
+        x +
+        (
+            Math.random() * 12 -
+            6
+        );
+
+    const jitterY =
+        y +
+        (
+            Math.random() * 12 -
+            6
+        );
+
+    touchDown(
+        0,
+        jitterX,
+        jitterY
     );
-  }
 
-  return brain;
+    usleep(
+        16000 +
+        Math.random() * 20000
+    );
+
+    touchUp(
+        0,
+        jitterX,
+        jitterY
+    );
 }
 
-function stripCoordinates(brain) {
-  const copy = { ...brain };
+function doSwipe(
+    x1,
+    y1,
+    x2,
+    y2
+) {
 
-  delete copy.x;
-  delete copy.y;
-  delete copy.start;
-  delete copy.end;
-  delete copy.rows;
-  delete copy.steps;
-  delete copy.text;
-  delete copy.duration;
+    if (
+        !isFiniteNumber(
+            Number(x1)
+        ) ||
+        !isFiniteNumber(
+            Number(y1)
+        ) ||
+        !isFiniteNumber(
+            Number(x2)
+        ) ||
+        !isFiniteNumber(
+            Number(y2)
+        )
+    ) {
 
-  return copy;
-}
-
-// ============================================================
-// GUARDS
-// ============================================================
-
-function applyStateGuards(brain, history) {
-  const result = { ...brain };
-
-  // Đang ở app khác / Home Screen.
-  if (
-    (result.state === "external_app" || result.state === "home_screen") &&
-    result.action !== "launch" &&
-    result.action !== "wait"
-  ) {
-    return {
-      ...stripCoordinates(result),
-      action: "launch",
-      purpose: "recovery",
-      reason: "Target application is not visible.",
-      decision: "Recover the target application before continuing.",
-      expected_result: "The target application becomes visible.",
-    };
-  }
-
-  // Cuộc gọi đến.
-  if (
-    result.state === "incoming_call" &&
-    ["tap", "plan", "type", "swipe", "wheel"].includes(result.action)
-  ) {
-    return {
-      ...stripCoordinates(result),
-      action: "wait",
-      purpose: "incoming_call",
-      wait: 1500,
-      reason: "Incoming call is blocking normal interaction.",
-      decision: "Do not answer or reject the call automatically.",
-      expected_result: "The call interruption disappears or the UI becomes stable.",
-    };
-  }
-
-  // Thiết bị bị khóa.
-  if (result.state === "device_lock") {
-    return {
-      ...stripCoordinates(result),
-      action: "fail",
-      purpose: "device_lock",
-      reason: "Device is locked.",
-      decision: "Stop safely.",
-      expected_result: "Manual recovery is required.",
-    };
-  }
-
-  // Mật khẩu đã verified: không nhập lại, trừ khi app báo lỗi.
-  if (
-    history.passwordSubmitted &&
-    result.purpose === "password" &&
-    result.state !== "error" &&
-    ["plan", "type", "tap"].includes(result.action)
-  ) {
-    return {
-      ...stripCoordinates(result),
-      action: "wait",
-      purpose: "password",
-      wait: 600,
-      reason: "Password was already verified as submitted.",
-      decision: "Do not enter the password again.",
-      expected_result: "The application continues beyond the password step.",
-    };
-  }
-
-  return result;
-}
-
-function applyConfidenceGuard(brain) {
-  if (brain.confidence >= MIN_CONFIDENCE) {
-    return brain;
-  }
-
-  if (!["tap", "swipe", "type", "wheel", "plan", "restart"].includes(brain.action)) {
-    return brain;
-  }
-
-  return {
-    ...stripCoordinates(brain),
-    action: "wait",
-    purpose: "low_confidence",
-    wait: 800,
-    reason: "Visual confidence is too low for a risky action.",
-    decision: "Wait for a clearer observation.",
-    expected_result: "The next screenshot provides stronger evidence.",
-  };
-}
-
-function applyLoopGuard(brain, history) {
-  const stop = (purpose, reason) => ({
-    ...stripCoordinates(brain),
-    action: "fail",
-    purpose,
-    reason,
-    decision: "Stop instead of looping.",
-    expected_result: "Manual inspection is required.",
-  });
-
-  // Giới hạn wait theo từng loại tình huống (chỉ áp cho action wait).
-  if (brain.action === "wait") {
-    let limit = MAX_CONSECUTIVE_WAITS;
-    let purpose = "loop_guard";
-    let reason = "Too many consecutive waits.";
-
-    if (brain.state === "incoming_call") {
-      limit = MAX_CALL_WAITS;
-      reason = "Incoming call remained unresolved for too long.";
-    } else if (brain.state === "loading") {
-      limit = MAX_LOADING_WAITS;
-      purpose = "loading_timeout";
-      reason = "Loading remained unchanged for too long.";
+        throw new Error(
+            "Tọa độ swipe không hợp lệ."
+        );
     }
 
-    if (history.consecutiveWaits >= limit) {
-      return stop(purpose, reason);
-    }
-  }
-
-  // Restart / launch luôn có giới hạn, bất kể state.
-  if (brain.action === "restart" && history.restartCount >= MAX_RESTARTS) {
-    return stop("loop_guard", "Restart limit reached.");
-  }
-
-  if (brain.action === "launch" && history.launchCount >= MAX_LAUNCHES) {
-    return stop("loop_guard", "Launch recovery limit reached.");
-  }
-
-  return brain;
+    at.swipe(
+        Number(x1),
+        Number(y1),
+        Number(x2),
+        Number(y2)
+    );
 }
+
+
+// ============================================================
+// KEYBOARDS
+// ============================================================
+
+const NUM_KEYS = {
+
+    "1": {
+        x: 157.04,
+        y: 964.61
+    },
+
+    "2": {
+        x: 415.68,
+        y: 986.01
+    },
+
+    "3": {
+        x: 635.34,
+        y: 952.40
+    },
+
+    "4": {
+        x: 197.07,
+        y: 1078.64
+    },
+
+    "5": {
+        x: 413.64,
+        y: 1071.52
+    },
+
+    "6": {
+        x: 642.52,
+        y: 1055.24
+    },
+
+    "7": {
+        x: 174.49,
+        y: 1164.18
+    },
+
+    "8": {
+        x: 417.74,
+        y: 1179.44
+    },
+
+    "9": {
+        x: 645.60,
+        y: 1160.11
+    },
+
+    "0": {
+        x: 418.76,
+        y: 1271.08
+    }
+};
+
+
+const KEY_COORDS = {
+
+    q:{x:34.89,y:959.52},
+    w:{x:106.74,y:959.52},
+    e:{x:175.51,y:975.81},
+    r:{x:261.73,y:971.74},
+    t:{x:322.29,y:962.58},
+    y:{x:414.67,y:950.37},
+    u:{x:495.75,y:942.22},
+    i:{x:547.06,y:975.81},
+    o:{x:631.23,y:957.49},
+    p:{x:713.34,y:943.24},
+
+    a:{x:62.60,y:1086.79},
+    s:{x:144.72,y:1082.71},
+    d:{x:230.93,y:1068.47},
+    f:{x:316.12,y:1069.48},
+    g:{x:368.48,y:1075.59},
+    h:{x:431.09,y:1078.64},
+    j:{x:524.48,y:1071.52},
+    k:{x:595.31,y:1069.48},
+    l:{x:708.21,y:1056.25},
+
+    z:{x:162.16,y:1188.60},
+    x:{x:241.20,y:1182.50},
+    c:{x:303.81,y:1189.62},
+    v:{x:378.73,y:1172.32},
+    b:{x:441.34,y:1181.48},
+    n:{x:528.59,y:1178.43},
+    m:{x:608.65,y:1170.28}
+};
+
+
+const SHIFT = {
+    x: 70.82,
+    y: 1188.60
+};
+
+const BACKSPACE = {
+    x: 712.31,
+    y: 1178.43
+};
+
+const SPACE = {
+    x: 420.82,
+    y: 1299.58
+};
+
+
+function tapKey(letter) {
+
+    const lower =
+        safeString(letter)
+            .toLowerCase();
+
+    const isUpper =
+        letter !== lower &&
+        /[A-Z]/.test(letter);
+
+    if (isUpper) {
+
+        doTap(
+            SHIFT.x,
+            SHIFT.y
+        );
+
+        usleep(
+            120000 +
+            Math.random() * 50000
+        );
+    }
+
+    const coord =
+        KEY_COORDS[lower];
+
+    if (!coord) {
+
+        throw new Error(
+            "Không có tọa độ keyboard cho: " +
+            letter
+        );
+    }
+
+    doTap(
+        coord.x,
+        coord.y
+    );
+}
+
+
+// ============================================================
+// TYPE NUMBER
+// ============================================================
+
+function typeNumberString(
+    digits
+) {
+
+    for (
+        const digit of digits
+    ) {
+
+        const k =
+            NUM_KEYS[digit];
+
+        if (!k) {
+
+            throw new Error(
+                "Không có tọa độ Numpad cho: " +
+                digit
+            );
+        }
+
+        doTap(
+            k.x,
+            k.y
+        );
+
+        wait(
+            150 +
+            Math.random() * 100
+        );
+    }
+}
+
+
+// ============================================================
+// VIETNAMESE TELEX
+// ============================================================
+
+function charToTelexKeys(ch) {
+
+    if (ch === "đ") {
+        return ["d", "d"];
+    }
+
+    if (ch === "Đ") {
+        return ["D", "d"];
+    }
+
+    const isUpper =
+        ch !== ch.toLowerCase();
+
+    const nfd =
+        ch.normalize("NFD");
+
+    const first =
+        nfd[0];
+
+    if (!first) {
+        return [];
+    }
+
+    const baseChar =
+        isUpper
+            ? first.toUpperCase()
+            : first.toLowerCase();
+
+    const baseLower =
+        first.toLowerCase();
+
+    const marks =
+        nfd.slice(1);
+
+    let modKey = "";
+
+    let toneKey = "";
+
+    for (
+        let i = 0;
+        i < marks.length;
+        i++
+    ) {
+
+        const m =
+            marks[i];
+
+        if (
+            m === "\u0300"
+        ) {
+            toneKey = "f";
+
+        } else if (
+            m === "\u0301"
+        ) {
+            toneKey = "s";
+
+        } else if (
+            m === "\u0303"
+        ) {
+            toneKey = "x";
+
+        } else if (
+            m === "\u0309"
+        ) {
+            toneKey = "r";
+
+        } else if (
+            m === "\u0323"
+        ) {
+            toneKey = "j";
+
+        } else if (
+            m === "\u0302"
+        ) {
+            modKey =
+                baseLower;
+
+        } else if (
+            m === "\u0306" ||
+            m === "\u031B"
+        ) {
+            modKey = "w";
+        }
+    }
+
+    const keys = [
+        baseChar
+    ];
+
+    if (modKey) {
+        keys.push(modKey);
+    }
+
+    if (toneKey) {
+        keys.push(toneKey);
+    }
+
+    return keys;
+}
+
+
+function typeVietnameseTelex(
+    text,
+    options
+) {
+
+    options =
+        options || {};
+
+    const minDelay =
+        options.minDelay ||
+        250;
+
+    const maxDelay =
+        options.maxDelay ||
+        500;
+
+    function randomDelay() {
+
+        return (
+            minDelay +
+            Math.random() *
+            (
+                maxDelay -
+                minDelay
+            )
+        );
+    }
+
+    text =
+        safeString(text);
+
+    for (
+        let i = 0;
+        i < text.length;
+        i++
+    ) {
+
+        const ch =
+            text[i];
+
+        if (ch === " ") {
+
+            doTap(
+                SPACE.x,
+                SPACE.y
+            );
+
+            usleep(
+                randomDelay() *
+                1000
+            );
+
+            continue;
+        }
+
+        const keys =
+            charToTelexKeys(ch);
+
+        for (
+            let k = 0;
+            k < keys.length;
+            k++
+        ) {
+
+            tapKey(
+                keys[k]
+            );
+
+            usleep(
+                randomDelay() *
+                1000
+            );
+        }
+    }
+}
+
+
+// ============================================================
+// PASSWORD CHECK
+// ============================================================
+
+function isPasswordText(text) {
+
+    text =
+        safeString(text);
+
+    if (!text) {
+        return false;
+    }
+
+    const password =
+        extractPasswordFromInfo();
+
+    if (!password) {
+        return false;
+    }
+
+    return text === password;
+}
+
+
+function extractPasswordFromInfo() {
+
+    const marker =
+        "Mật khẩu: ";
+
+    const index =
+        INFO.indexOf(marker);
+
+    if (index < 0) {
+        return "";
+    }
+
+    return INFO
+        .substring(
+            index + marker.length
+        )
+        .split("\n")[0]
+        .trim();
+}
+
+
+// ============================================================
+// TYPE - HỖ TRỢ CHỮ + SỐ
+// ============================================================
+
+function doType(text) {
+
+    text =
+        safeString(text);
+
+    if (!text) {
+
+        throw new Error(
+            "Type text rỗng."
+        );
+    }
+
+    // --------------------------------------------------------
+    // PASSWORD GUARD
+    // --------------------------------------------------------
+
+    if (
+        isPasswordText(text)
+    ) {
+
+        if (passwordTyped) {
+
+            throw new Error(
+                "Password đã nhập rồi - không nhập lại."
+            );
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // TOÀN SỐ
+    // --------------------------------------------------------
+
+    if (/^\d+$/.test(text)) {
+
+        typeNumberString(
+            text
+        );
+
+        return;
+    }
+
+
+    // --------------------------------------------------------
+    // HỖN HỢP CHỮ + SỐ
+    // --------------------------------------------------------
+
+    for (
+        let i = 0;
+        i < text.length;
+        i++
+    ) {
+
+        const ch =
+            text[i];
+
+        // Số
+        if (/\d/.test(ch)) {
+
+            const k =
+                NUM_KEYS[ch];
+
+            if (!k) {
+
+                throw new Error(
+                    "Không có tọa độ numpad cho: " +
+                    ch
+                );
+            }
+
+            doTap(
+                k.x,
+                k.y
+            );
+
+            wait(
+                150 +
+                Math.random() * 100
+            );
+
+            continue;
+        }
+
+        // Space
+        if (ch === " ") {
+
+            doTap(
+                SPACE.x,
+                SPACE.y
+            );
+
+            wait(
+                200 +
+                Math.random() * 150
+            );
+
+            continue;
+        }
+
+        // Chữ
+        const keys =
+            charToTelexKeys(ch);
+
+        if (!keys.length) {
+
+            throw new Error(
+                "Không thể nhập ký tự: " +
+                ch
+            );
+        }
+
+        for (
+            let k = 0;
+            k < keys.length;
+            k++
+        ) {
+
+            tapKey(
+                keys[k]
+            );
+
+            wait(
+                250 +
+                Math.random() * 250
+            );
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // PASSWORD SUCCESS
+    // --------------------------------------------------------
+
+    if (
+        isPasswordText(text)
+    ) {
+
+        passwordTyped =
+            true;
+
+        console.log(
+            "[PASSWORD] Đã nhập password 1 lần."
+        );
+
+        at.toast(
+            "Password đã nhập",
+            2
+        );
+    }
+}
+
+
+// ============================================================
+// WHEEL
+// ============================================================
+
+function scrollOneStep(
+    x,
+    startY,
+    direction
+) {
+
+    const swipeSign =
+        direction > 0
+            ? -1
+            : 1;
+
+    const totalDistance =
+        WHEEL_STEP_DISTANCE *
+        swipeSign;
+
+    let currentY =
+        startY;
+
+    touchDown(
+        0,
+        x,
+        startY
+    );
+
+    for (
+        let i = 1;
+        i <= WHEEL_STEP_COUNT;
+        i++
+    ) {
+
+        const t =
+            i /
+            WHEEL_STEP_COUNT;
+
+        const eased =
+            1 -
+            Math.pow(
+                1 - t,
+                3
+            );
+
+        currentY =
+            startY +
+            totalDistance *
+            eased;
+
+        usleep(
+            16000 +
+            Math.random() * 2000
+        );
+
+        touchMove(
+            0,
+            x,
+            currentY
+        );
+    }
+
+    usleep(20000);
+
+    touchUp(
+        0,
+        x,
+        currentY
+    );
+}
+
+
+function scrollSteps(
+    x,
+    startY,
+    delta
+) {
+
+    delta =
+        Number(delta);
+
+    if (
+        !isFiniteNumber(delta) ||
+        !Number.isInteger(delta)
+    ) {
+
+        throw new Error(
+            "Wheel rows không hợp lệ."
+        );
+    }
+
+    if (
+        delta === 0 ||
+        Math.abs(delta) >
+            MAX_WHEEL_ROWS
+    ) {
+
+        throw new Error(
+            "Wheel rows vượt giới hạn."
+        );
+    }
+
+    const dir =
+        delta > 0
+            ? 1
+            : -1;
+
+    const count =
+        Math.abs(delta);
+
+    for (
+        let i = 0;
+        i < count;
+        i++
+    ) {
+
+        scrollOneStep(
+            x,
+            startY,
+            dir
+        );
+
+        usleep(
+            350000 +
+            Math.random() * 200000
+        );
+    }
+}
+
+
+// ============================================================
+// FILE UTILITIES
+// ============================================================
+
+function readBase64(path) {
+
+    const commands = [
+
+        "base64 -i '" +
+        path +
+        "'",
+
+        "openssl base64 -A -in '" +
+        path +
+        "'",
+
+        "base64 '" +
+        path +
+        "'"
+    ];
+
+    for (
+        let i = 0;
+        i < commands.length;
+        i++
+    ) {
+
+        try {
+
+            const output =
+                exec(
+                    commands[i]
+                );
+
+            if (!output) {
+                continue;
+            }
+
+            const clean =
+                String(output)
+                    .replace(/\s/g, "");
+
+            if (
+                clean.length > 100 &&
+                /^[A-Za-z0-9+/=]+$/.test(
+                    clean
+                )
+            ) {
+
+                return clean;
+            }
+
+        } catch (e) {}
+    }
+
+    return null;
+}
+
+
+function writeFile(
+    path,
+    data
+) {
+
+    try {
+
+        if (
+            typeof fs !==
+                "undefined" &&
+            fs.writeFile
+        ) {
+
+            fs.writeFile(
+                path,
+                data
+            );
+
+            return true;
+        }
+
+    } catch (e) {}
+
+
+    try {
+
+        const escaped =
+            String(data)
+                .replace(
+                    /'/g,
+                    "'\\''"
+                );
+
+        exec(
+            "printf '%s' '" +
+            escaped +
+            "' > '" +
+            path +
+            "'"
+        );
+
+        return true;
+
+    } catch (e) {
+
+        return false;
+    }
+}
+
+
+function removeFile(path) {
+
+    try {
+
+        if (
+            typeof fs !==
+                "undefined" &&
+            fs.remove
+        ) {
+
+            fs.remove(path);
+
+            return;
+        }
+
+    } catch (e) {}
+
+    try {
+
+        exec(
+            "rm -f '" +
+            path +
+            "'"
+        );
+
+    } catch (e) {}
+}
+
+
+// ============================================================
+// SERVER COMMUNICATION
+// ============================================================
+
+function callServer(
+    base64Image,
+    history
+) {
+
+    const payload =
+        JSON.stringify({
+
+            image:
+                "data:image/png;base64," +
+                base64Image,
+
+            key:
+                GEMINI_API_KEY,
+
+            goal:
+                GOAL,
+
+            info:
+                INFO,
+
+            rules:
+                RULES,
+
+            history:
+                history
+        });
+
+
+    if (
+        !writeFile(
+            PAYLOAD_PATH,
+            payload
+        )
+    ) {
+
+        return {
+
+            status: 0,
+
+            text:
+                "Không ghi được payload"
+        };
+    }
+
+
+    const command =
+        "curl -sS -m 90 " +
+        "-X POST " +
+        "-H 'Content-Type: application/json' " +
+        "--data-binary @'" +
+        PAYLOAD_PATH +
+        "' " +
+        "-w '\\n%{http_code}' " +
+        "'" +
+        SERVER_URL +
+        "' 2>&1";
+
+
+    let output = "";
+
+    try {
+
+        output =
+            exec(command);
+
+    } catch (e) {
+
+        removeFile(
+            PAYLOAD_PATH
+        );
+
+        return {
+
+            status: 0,
+
+            text:
+                safeString(e)
+        };
+    }
+
+
+    removeFile(
+        PAYLOAD_PATH
+    );
+
+    output =
+        safeString(output);
+
+
+    const index =
+        output.lastIndexOf("\n");
+
+
+    if (index < 0) {
+
+        return {
+
+            status: 0,
+
+            text:
+                output
+        };
+    }
+
+
+    const status =
+        parseInt(
+            output.substring(
+                index + 1
+            ),
+            10
+        );
+
+
+    return {
+
+        status:
+            isNaN(status)
+                ? 0
+                : status,
+
+        text:
+            output.substring(
+                0,
+                index
+            )
+    };
+}
+
+
+// ============================================================
+// JSON & COORDINATES
+// ============================================================
+
+function parseJson(text) {
+
+    const raw =
+        safeString(text)
+            .trim();
+
+    try {
+
+        return JSON.parse(
+            raw
+        );
+
+    } catch (e) {}
+
+
+    const first =
+        raw.indexOf("{");
+
+    const last =
+        raw.lastIndexOf("}");
+
+
+    if (
+        first >= 0 &&
+        last > first
+    ) {
+
+        try {
+
+            return JSON.parse(
+                raw.substring(
+                    first,
+                    last + 1
+                )
+            );
+
+        } catch (e2) {}
+    }
+
+
+    return null;
+}
+
+
+function toTap(
+    x,
+    y,
+    imgW,
+    imgH
+) {
+
+    x =
+        Number(x);
+
+    y =
+        Number(y);
+
+    imgW =
+        Number(imgW);
+
+    imgH =
+        Number(imgH);
+
+
+    if (
+        !isFiniteNumber(x) ||
+        !isFiniteNumber(y)
+    ) {
+
+        throw new Error(
+            "AI trả tọa độ không hợp lệ."
+        );
+    }
+
+
+    let sx = 1;
+
+    let sy = 1;
+
+
+    if (
+        TAP_SCREEN_WIDTH > 0 &&
+        imgW > 0
+    ) {
+
+        sx =
+            TAP_SCREEN_WIDTH /
+            imgW;
+    }
+
+
+    if (
+        TAP_SCREEN_HEIGHT > 0 &&
+        imgH > 0
+    ) {
+
+        sy =
+            TAP_SCREEN_HEIGHT /
+            imgH;
+    }
+
+
+    return {
+
+        x:
+            Math.round(
+                x * sx
+            ),
+
+        y:
+            Math.round(
+                y * sy
+            )
+    };
+}
+
 
 // ============================================================
 // VALIDATION
 // ============================================================
 
-function isNum(value) {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function validateAction(brain, info, history) {
-  const errors = [];
-
-  if (!ACTIONS.includes(brain.action)) {
-    return ["Invalid action."];
-  }
-
-  const checkText = (text, label) => {
-    if (typeof text !== "string" || !text.length) {
-      errors.push(`${label} requires text.`);
-    } else if (!infoAllows(info, text)) {
-      errors.push(`${label} contains text not present in INFO values.`);
-    }
-  };
-
-  if (brain.action === "tap") {
-    if (!isNum(brain.x) || !isNum(brain.y)) {
-      errors.push("tap requires x and y.");
-    }
-  }
-
-  if (brain.action === "type") {
-    checkText(brain.text, "type");
+function validateCoordinate(
+    x,
+    y
+) {
 
     if (
-      brain.purpose === "password" &&
-      getPassword(info) &&
-      nfc(brain.text) !== nfc(getPassword(info))
+        !isFiniteNumber(
+            Number(x)
+        ) ||
+        !isFiniteNumber(
+            Number(y)
+        )
     ) {
-      errors.push("Password must exactly match INFO.");
-    }
-  }
 
-  if (brain.action === "swipe") {
-    const values = [brain.start?.x, brain.start?.y, brain.end?.x, brain.end?.y];
-
-    if (!brain.start || !brain.end || !values.every(isNum)) {
-      errors.push("swipe requires valid start and end.");
-    }
-  }
-
-  if (brain.action === "wheel") {
-    if (!isNum(brain.x) || !isNum(brain.y)) {
-      errors.push("wheel requires x and y.");
+        return false;
     }
 
-    if (!Array.isArray(brain.rows) || brain.rows.length === 0) {
-      errors.push("wheel requires rows.");
-    } else if (brain.rows.some((r) => !isNum(r.x) || !isNum(r.y))) {
-      errors.push("wheel rows require x and y.");
-    }
-  }
 
-  if (brain.action === "plan") {
-    const steps = brain.steps;
+    if (
+        Number(x) < -100 ||
+        Number(y) < -100
+    ) {
 
-    if (!Array.isArray(steps) || steps.length === 0) {
-      errors.push("plan requires steps.");
-    } else {
-      steps.forEach((step, i) => {
-        if (!PLAN_ACTIONS.includes(step.action)) {
-          errors.push(`Invalid plan step ${i}.`);
-        } else if (step.action === "tap") {
-          if (!isNum(step.x) || !isNum(step.y)) {
-            errors.push(`Plan tap step ${i} requires x/y.`);
-          }
-        } else {
-          checkText(step.text, `Plan type step ${i}`);
-        }
-      });
+        return false;
     }
 
-    // PASSWORD PLAN: tap -> type -> tap
-    if (brain.purpose === "password") {
-      const password = getPassword(info);
 
-      if (history.passwordSubmitted && brain.state !== "error") {
-        errors.push("Password already verified.");
-      }
-
-      if (!password) {
-        errors.push("Password missing from INFO.");
-      }
-
-      if (!Array.isArray(steps) || steps.length !== 3) {
-        errors.push("Password plan must contain exactly 3 steps.");
-      } else {
-        const [s1, s2, s3] = steps;
-
-        if (s1.action !== "tap") errors.push("Password step 1 must be tap.");
-        if (s2.action !== "type") errors.push("Password step 2 must be type.");
-        if (s3.action !== "tap") errors.push("Password step 3 must be tap.");
-
-        if (password && nfc(s2.text) !== nfc(password)) {
-          errors.push("Password must exactly match INFO.");
-        }
-      }
-    }
-
-    // NAME PLAN: tap -> type -> tap -> type (chấp nhận cả hai thứ tự)
-    if (brain.purpose === "name") {
-      const { familyName, givenName } = getNameInfo(info);
-      const validNames = [familyName, givenName].filter(Boolean).map(nfc);
-
-      if (history.nameSubmitted) {
-        errors.push("Name already verified.");
-      }
-
-      if (validNames.length < 2) {
-        errors.push("Name data missing from INFO.");
-      }
-
-      if (!Array.isArray(steps) || steps.length !== 4) {
-        errors.push("Name plan must contain exactly 4 steps.");
-      } else {
-        const [s1, s2, s3, s4] = steps;
-
-        if (s1.action !== "tap") errors.push("Name step 1 must be tap.");
-        if (s2.action !== "type") errors.push("Name step 2 must be type.");
-        if (s3.action !== "tap") errors.push("Name step 3 must be tap.");
-        if (s4.action !== "type") errors.push("Name step 4 must be type.");
-
-        if (!validNames.includes(nfc(s2.text))) {
-          errors.push("Name step 2 must use an exact INFO name.");
-        }
-
-        if (!validNames.includes(nfc(s4.text))) {
-          errors.push("Name step 4 must use an exact INFO name.");
-        }
-
-        if (nfc(s2.text) === nfc(s4.text)) {
-          errors.push("Name plan must use both name values.");
-        }
-      }
-    }
-  }
-
-  if (brain.action === "done" && brain.confidence < 0.7) {
-    errors.push("done requires confidence >= 0.7.");
-  }
-
-  return errors;
+    return true;
 }
 
-// ============================================================
-// FALLBACK
-// ============================================================
-
-function fallbackAction(reason, options = {}) {
-  const { transient = false, error = null } = options;
-
-  return {
-    state: "unknown",
-    confidence: 0,
-    observations: [],
-    diagnosis: transient ? "Temporary vision/API failure." : "Safe fallback required.",
-    decision: "Wait and observe again.",
-    expected_result: "The next screenshot provides more information.",
-    action: "wait",
-    purpose: "fallback",
-    reason: reason || "Unable to produce a safe action.",
-    wait: 600,
-    transient,
-    error,
-  };
-}
 
 // ============================================================
-// 0..1000 -> PIXEL (chỉ gọi ở bước tạo response cuối)
+// PLAN VALIDATION
 // ============================================================
 
-function scalePoint(x, y, width, height) {
-  return {
-    x: Math.round((clampNumber(x, 0, 1000, 0) / 1000) * width),
-    y: Math.round((clampNumber(y, 0, 1000, 0) / 1000) * height),
-  };
-}
+function validatePlan(
+    steps
+) {
 
-function toPixelAction(brain, width, height) {
-  const base = {
-    purpose: brain.purpose,
-    reason: brain.reason,
-  };
+    if (
+        !Array.isArray(steps)
+    ) {
 
-  switch (brain.action) {
-    case "tap": {
-      const p = scalePoint(brain.x, brain.y, width, height);
-
-      return { action: "tap", x: p.x, y: p.y, ...base };
+        return false;
     }
 
-    case "type":
-      return { action: "type", text: brain.text, ...base };
 
-    case "swipe": {
-      const s = scalePoint(brain.start.x, brain.start.y, width, height);
-      const e = scalePoint(brain.end.x, brain.end.y, width, height);
+    if (
+        steps.length < 1 ||
+        steps.length >
+            MAX_PLAN_STEPS
+    ) {
 
-      return {
-        action: "swipe",
-        start: { x: s.x, y: s.y },
-        end: { x: e.x, y: e.y },
-        x1: s.x,
-        y1: s.y,
-        x2: e.x,
-        y2: e.y,
-        duration: brain.duration || 500,
-        ...base,
-      };
+        return false;
     }
 
-    case "wait": {
-      const ms = brain.wait || 800;
 
-      return {
-        action: "wait",
-        ms,
-        wait: ms,
-        ...base,
-      };
+    for (
+        let i = 0;
+        i < steps.length;
+        i++
+    ) {
+
+        const st =
+            steps[i];
+
+        if (!st) {
+            return false;
+        }
+
+
+        if (
+            st.action !== "tap" &&
+            st.action !== "type"
+        ) {
+
+            return false;
+        }
+
+
+        // ----------------------------------------------------
+        // TAP
+        // ----------------------------------------------------
+
+        if (
+            st.action === "tap"
+        ) {
+
+            if (
+                !validateCoordinate(
+                    st.x,
+                    st.y
+                )
+            ) {
+
+                return false;
+            }
+
+
+            if (
+                i > 0 &&
+                steps[i - 1].action ===
+                    "tap"
+            ) {
+
+                return false;
+            }
+        }
+
+
+        // ----------------------------------------------------
+        // TYPE
+        // ----------------------------------------------------
+
+        if (
+            st.action === "type"
+        ) {
+
+            const txt =
+                safeString(
+                    st.text
+                );
+
+
+            if (
+                !txt ||
+                txt.length > 300
+            ) {
+
+                return false;
+            }
+
+
+            if (
+                i > 0 &&
+                steps[i - 1].action !==
+                    "tap"
+            ) {
+
+                return false;
+            }
+
+
+            // Chỉ type dữ liệu nằm trong INFO.
+            if (
+                INFO.indexOf(txt) < 0
+            ) {
+
+                return false;
+            }
+
+
+            // ------------------------------------------------
+            // PASSWORD GUARD
+            // ------------------------------------------------
+
+            if (
+                isPasswordText(txt) &&
+                passwordTyped
+            ) {
+
+                console.log(
+                    "[PLAN BLOCK] Password đã nhập, không nhập lại."
+                );
+
+                return false;
+            }
+        }
     }
 
-    case "wheel": {
-      const p = scalePoint(brain.x, brain.y, width, height);
 
-      return {
-        action: "wheel",
-        x: p.x,
-        y: p.y,
-        // rows giữ nguyên hệ 0..1000 (giống 6.1).
-        rows: (brain.rows || []).map((row) => ({
-          x: row.x,
-          y: row.y,
-          delta: row.delta,
-        })),
-        ...base,
-      };
-    }
-
-    case "plan":
-      return {
-        action: "plan",
-        steps: (brain.steps || []).map((step) => {
-          if (step.action === "tap") {
-            const p = scalePoint(step.x, step.y, width, height);
-
-            return { action: "tap", x: p.x, y: p.y };
-          }
-
-          return { action: "type", text: step.text };
-        }),
-        ...base,
-      };
-
-    case "launch":
-    case "restart":
-    case "done":
-    case "fail":
-      return { action: brain.action, ...base };
-
-    default:
-      return {
-        action: "wait",
-        ms: 600,
-        wait: 600,
-        purpose: "fallback",
-        reason: "Unknown action converted to safe wait.",
-      };
-  }
+    return true;
 }
 
+
 // ============================================================
-// PROMPT (SYSTEM_RULES chỉ gửi qua systemInstruction)
+// EXECUTE PLAN
 // ============================================================
 
-function buildPrompt({ goal, info, rules, mode, failure, width, height, history, historyAnalysis }) {
-  return `
-CURRENT GOAL:
-${String(goal || "")}
+function executePlan(r) {
 
-INFO:
-${serializeInfo(info)}
+    const steps =
+        r.steps;
 
-USER / TASK RULES:
-${Array.isArray(rules) ? rules.map((r) => `- ${String(r)}`).join("\n") : ""}
 
-MODE:
-${String(mode || "normal")}
+    if (
+        !validatePlan(
+            steps
+        )
+    ) {
 
-SCREEN SIZE:
-width=${width}
-height=${height}
+        throw new Error(
+            "Plan không hợp lệ."
+        );
+    }
 
-AGENT MEMORY:
-${JSON.stringify(
-  {
-    passwordSubmitted: historyAnalysis.passwordSubmitted,
-    nameSubmitted: historyAnalysis.nameSubmitted,
-    phoneSubmitted: historyAnalysis.phoneSubmitted,
-    lastAction: historyAnalysis.lastAction,
-    lastState: historyAnalysis.lastState,
-    lastOutcome: historyAnalysis.lastOutcome,
-    consecutiveWaits: historyAnalysis.consecutiveWaits,
-    restartCount: historyAnalysis.restartCount,
-    launchCount: historyAnalysis.launchCount,
-    lastTransaction: historyAnalysis.lastTransaction,
-  },
-  null,
-  2
-)}
 
-RECENT HISTORY:
-${JSON.stringify(history, null, 2)}
+    let sig =
+        "plan";
 
-FAILURE / RECOVERY:
-${failure ? JSON.stringify(failure, null, 2) : "No failure reported."}
 
-TASK:
-Analyze the screenshot. Determine the current UI state, what the app is
-asking for, whether the screen is blocked, whether the previous action
-executed and was verified, whether the goal is complete, then choose the
-smallest safe next action and state the expected result.
+    for (
+        let i = 0;
+        i < steps.length;
+        i++
+    ) {
 
-Remember:
-- coordinates are normalized 0..1000; ALWAYS include x and y for taps
-- wheel.rows remain normalized 0..1000
-- do not translate INFO values
-- proposed and plan are not verified
-- never re-enter a verified password unless the app rejected it
+        const st =
+            steps[i];
 
-Return ONLY JSON.
-`;
+
+        // ----------------------------------------------------
+        // TAP
+        // ----------------------------------------------------
+
+        if (
+            st.action === "tap"
+        ) {
+
+            const p =
+                toTap(
+                    st.x,
+                    st.y,
+                    r.image_width,
+                    r.image_height
+                );
+
+
+            at.toast(
+                "Plan " +
+                (i + 1) +
+                "/" +
+                steps.length +
+                ": tap",
+                1
+            );
+
+
+            doTap(
+                p.x,
+                p.y
+            );
+
+
+            sig +=
+                ":t" +
+                Math.round(
+                    p.x / 20
+                ) +
+                "," +
+                Math.round(
+                    p.y / 20
+                );
+
+
+            wait(
+                PLAN_AFTER_TAP_MS
+            );
+        }
+
+
+        // ----------------------------------------------------
+        // TYPE
+        // ----------------------------------------------------
+
+        else if (
+            st.action === "type"
+        ) {
+
+            const text =
+                safeString(
+                    st.text
+                );
+
+
+            // Password guard lần cuối.
+            if (
+                isPasswordText(text) &&
+                passwordTyped
+            ) {
+
+                throw new Error(
+                    "Password đã nhập trước đó, plan không được nhập lại."
+                );
+            }
+
+
+            at.toast(
+                "Plan " +
+                (i + 1) +
+                "/" +
+                steps.length +
+                ": nhập",
+                1
+            );
+
+
+            doType(
+                text
+            );
+
+
+            sig +=
+                ":y" +
+                text.length;
+
+
+            wait(
+                PLAN_AFTER_TYPE_MS
+            );
+        }
+    }
+
+
+    return sig;
 }
 
+
 // ============================================================
-// GEMINI
+// RUN ONE STEP
 // ============================================================
 
-async function callGemini({ image, prompt, model, timeoutMs, apiKey }) {
-  if (!apiKey) {
-    throw new Error("Missing Gemini API key");
-  }
+function runStep(history) {
 
-  const imageString = String(image || "");
+    // --------------------------------------------------------
+    // SCREENSHOT
+    // --------------------------------------------------------
 
-  let mimeType = "image/png";
-  let base64 = "";
-
-  const match = imageString.match(/^data:(image\/[^;]+);base64,(.+)$/s);
-
-  if (match) {
-    mimeType = match[1];
-    base64 = match[2];
-  } else {
-    base64 = imageString.replace(/^data:[^,]+,/, "");
-  }
-
-  if (!base64) {
-    throw new Error("Missing image data");
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(
-      `${GEMINI_BASE}/${encodeURIComponent(model)}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey,
-        },
-        signal: controller.signal,
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [{ text: SYSTEM_RULES }],
-          },
-          contents: [
-            {
-              role: "user",
-              parts: [
-                { inline_data: { mime_type: mimeType, data: base64 } },
-                { text: prompt },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature: 0,
-            responseMimeType: "application/json",
-          },
-        }),
-      }
+    at.screenshot(
+        SCREENSHOT_PATH
     );
 
-    const raw = await response.text();
+    wait(300);
 
-    if (!response.ok) {
-      throw new Error(`Gemini HTTP ${response.status}: ${raw.slice(0, 1000)}`);
+
+    const base64Image =
+        readBase64(
+            SCREENSHOT_PATH
+        );
+
+
+    removeFile(
+        SCREENSHOT_PATH
+    );
+
+
+    if (!base64Image) {
+
+        at.toast(
+            "Không đọc được screenshot",
+            4
+        );
+
+        return {
+            stop: true
+        };
     }
 
-    let data;
+
+    if (
+        base64Image.length >
+        MAX_BASE64_LENGTH
+    ) {
+
+        at.toast(
+            "Ảnh quá lớn",
+            5
+        );
+
+        return {
+            stop: true
+        };
+    }
+
+
+    // --------------------------------------------------------
+    // SERVER
+    // --------------------------------------------------------
+
+    const response =
+        callServer(
+            base64Image,
+            history
+        );
+
+
+    if (
+        response.status !== 200
+    ) {
+
+        at.toast(
+            "HTTP " +
+            response.status +
+            ": " +
+            safeString(
+                response.text
+            ).substring(
+                0,
+                150
+            ),
+            5
+        );
+
+        return {
+            stop: true
+        };
+    }
+
+
+    // --------------------------------------------------------
+    // JSON
+    // --------------------------------------------------------
+
+    const r =
+        parseJson(
+            response.text
+        );
+
+
+    if (
+        !r ||
+        r.success !== true
+    ) {
+
+        at.toast(
+            "AI response lỗi: " +
+            safeString(
+                r && r.error
+                    ? r.error
+                    : response.text
+            ).substring(
+                0,
+                150
+            ),
+            5
+        );
+
+        return {
+            stop: true
+        };
+    }
+
+
+    const action =
+        safeString(
+            r.action
+        ).toLowerCase();
+
+
+    const reason =
+        safeString(
+            r.reason
+        );
+
+
+    // ========================================================
+    // DONE
+    // ========================================================
+
+    if (
+        action === "done"
+    ) {
+
+        at.toast(
+            "Hoàn thành: " +
+            reason,
+            4
+        );
+
+        return {
+
+            stop: true,
+
+            completed: true
+        };
+    }
+
+
+    // ========================================================
+    // FAIL
+    // ========================================================
+
+    if (
+        action === "fail"
+    ) {
+
+        at.toast(
+            "AI dừng: " +
+            reason,
+            5
+        );
+
+        return {
+            stop: true
+        };
+    }
+
+
+    // ========================================================
+    // WAIT
+    // ========================================================
+
+    if (
+        action === "wait"
+    ) {
+
+        let secs =
+            Number(
+                r.seconds
+            );
+
+
+        if (
+            !isFiniteNumber(secs) ||
+            secs <= 0
+        ) {
+
+            secs = 2;
+        }
+
+
+        secs =
+            clampNumber(
+                secs,
+                1,
+                MAX_WAIT_SECONDS
+            );
+
+
+        at.toast(
+            "Chờ " +
+            secs +
+            "s: " +
+            reason,
+            2
+        );
+
+
+        wait(
+            secs * 1000
+        );
+
+
+        return {
+
+            stop: false,
+
+            note:
+                "wait " +
+                secs +
+                "s: " +
+                reason,
+
+            signature:
+                "wait"
+        };
+    }
+
+
+    // ========================================================
+    // TAP
+    // ========================================================
+
+    if (
+        action === "tap"
+    ) {
+
+        if (
+            !validateCoordinate(
+                r.x,
+                r.y
+            )
+        ) {
+
+            at.toast(
+                "AI trả tọa độ tap lỗi",
+                5
+            );
+
+            return {
+                stop: true
+            };
+        }
+
+
+        const p =
+            toTap(
+                r.x,
+                r.y,
+                r.image_width,
+                r.image_height
+            );
+
+
+        at.toast(
+            "Tap " +
+            p.x +
+            "," +
+            p.y,
+            1
+        );
+
+
+        doTap(
+            p.x,
+            p.y
+        );
+
+
+        return {
+
+            stop: false,
+
+            note:
+                "tap (" +
+                p.x +
+                "," +
+                p.y +
+                "): " +
+                reason,
+
+            signature:
+                "tap:" +
+                Math.round(
+                    p.x / 20
+                ) +
+                ":" +
+                Math.round(
+                    p.y / 20
+                )
+        };
+    }
+
+
+    // ========================================================
+    // SWIPE
+    // ========================================================
+
+    if (
+        action === "swipe"
+    ) {
+
+        if (
+            !validateCoordinate(
+                r.x,
+                r.y
+            ) ||
+            !validateCoordinate(
+                r.x2,
+                r.y2
+            )
+        ) {
+
+            at.toast(
+                "AI trả tọa độ swipe lỗi",
+                5
+            );
+
+            return {
+                stop: true
+            };
+        }
+
+
+        const a =
+            toTap(
+                r.x,
+                r.y,
+                r.image_width,
+                r.image_height
+            );
+
+
+        const b =
+            toTap(
+                r.x2,
+                r.y2,
+                r.image_width,
+                r.image_height
+            );
+
+
+        at.toast(
+            "Swipe",
+            1
+        );
+
+
+        doSwipe(
+            a.x,
+            a.y,
+            b.x,
+            b.y
+        );
+
+
+        return {
+
+            stop: false,
+
+            note:
+                "swipe (" +
+                a.x +
+                "," +
+                a.y +
+                ")->(" +
+                b.x +
+                "," +
+                b.y +
+                "): " +
+                reason,
+
+            signature:
+                "swipe:" +
+                Math.round(
+                    a.x / 20
+                ) +
+                ":" +
+                Math.round(
+                    a.y / 20
+                ) +
+                ":" +
+                Math.round(
+                    b.x / 20
+                ) +
+                ":" +
+                Math.round(
+                    b.y / 20
+                )
+        };
+    }
+
+
+    // ========================================================
+    // PLAN
+    // ========================================================
+
+    if (
+        action === "plan"
+    ) {
+
+        try {
+
+            const sig =
+                executePlan(r);
+
+
+            return {
+
+                stop: false,
+
+                note:
+                    "plan " +
+                    r.steps.length +
+                    " bước: " +
+                    reason,
+
+                signature:
+                    sig
+            };
+
+        } catch (e) {
+
+            at.toast(
+                "Plan lỗi: " +
+                safeString(
+                    e.message || e
+                ).substring(
+                    0,
+                    120
+                ),
+                5
+            );
+
+
+            return {
+                stop: true
+            };
+        }
+    }
+
+
+    // ========================================================
+    // WHEEL
+    // ========================================================
+
+    if (
+        action === "wheel"
+    ) {
+
+        if (
+            !validateCoordinate(
+                r.x,
+                r.y
+            )
+        ) {
+
+            at.toast(
+                "Wheel tọa độ lỗi",
+                5
+            );
+
+            return {
+                stop: true
+            };
+        }
+
+
+        const rows =
+            Number(
+                r.rows
+            );
+
+
+        if (
+            !isFiniteNumber(rows) ||
+            !Number.isInteger(rows) ||
+            rows === 0 ||
+            Math.abs(rows) >
+                MAX_WHEEL_ROWS
+        ) {
+
+            at.toast(
+                "Wheel rows không hợp lệ",
+                5
+            );
+
+            return {
+                stop: true
+            };
+        }
+
+
+        const a =
+            toTap(
+                r.x,
+                r.y,
+                r.image_width,
+                r.image_height
+            );
+
+
+        const startY =
+            WHEEL_START_Y > 0
+                ? WHEEL_START_Y
+                : a.y;
+
+
+        at.toast(
+            "Cuộn " +
+            rows +
+            " nấc",
+            1
+        );
+
+
+        scrollSteps(
+            a.x,
+            startY,
+            rows
+        );
+
+
+        wait(400);
+
+
+        return {
+
+            stop: false,
+
+            note:
+                "wheel (" +
+                a.x +
+                "," +
+                startY +
+                ") rows=" +
+                rows +
+                ": " +
+                reason,
+
+            signature:
+                "wheel:" +
+                Math.round(
+                    a.x / 20
+                ) +
+                ":" +
+                rows
+        };
+    }
+
+
+    // ========================================================
+    // TYPE
+    // ========================================================
+
+    if (
+        action === "type"
+    ) {
+
+        const text =
+            safeString(
+                r.text
+            );
+
+
+        if (!text) {
+
+            at.toast(
+                "AI trả text rỗng",
+                5
+            );
+
+            return {
+                stop: true
+            };
+        }
+
+
+        if (
+            text.length > 300
+        ) {
+
+            at.toast(
+                "Text quá dài",
+                5
+            );
+
+            return {
+                stop: true
+            };
+        }
+
+
+        // ----------------------------------------------------
+        // INFO GUARD
+        // ----------------------------------------------------
+
+        if (
+            INFO.indexOf(text) < 0
+        ) {
+
+            at.toast(
+                "Text không nằm trong INFO",
+                5
+            );
+
+            return {
+                stop: true
+            };
+        }
+
+
+        // ----------------------------------------------------
+        // PASSWORD GUARD
+        // ----------------------------------------------------
+
+        if (
+            isPasswordText(text)
+        ) {
+
+            // Password đã nhập rồi:
+            // KHÔNG type lại.
+            //
+            // Không stop agent.
+            // Ghi history để server biết rằng
+            // password đã được nhập và cần
+            // chuyển sang bước tiếp theo.
+
+            if (passwordTyped) {
+
+                at.toast(
+                    "Password đã nhập - bỏ qua type lại",
+                    2
+                );
+
+                return {
+
+                    stop: false,
+
+                    note:
+                        "password đã nhập trước đó; không nhập lại; tiếp tục quan sát bước kế tiếp",
+
+                    signature:
+                        "password-already-typed"
+                };
+            }
+        }
+
+
+        // ----------------------------------------------------
+        // TYPE
+        // ----------------------------------------------------
+
+        at.toast(
+            "Nhập text",
+            1
+        );
+
+
+        doType(
+            text
+        );
+
+
+        // ----------------------------------------------------
+        // PASSWORD HISTORY
+        // ----------------------------------------------------
+
+        if (
+            isPasswordText(text)
+        ) {
+
+            passwordTyped =
+                true;
+
+            return {
+
+                stop: false,
+
+                note:
+                    "đã nhập Mật khẩu đúng 1 lần; không được nhập lại; quan sát màn hình tiếp theo",
+
+                signature:
+                    "password-typed-once"
+            };
+        }
+
+
+        return {
+
+            stop: false,
+
+            note:
+                "type text: " +
+                reason,
+
+            signature:
+                "type:" +
+                text.length
+        };
+    }
+
+
+    // ========================================================
+    // INVALID ACTION
+    // ========================================================
+
+    at.toast(
+        "Action không hợp lệ: " +
+        action,
+        5
+    );
+
+
+    return {
+        stop: true
+    };
+}
+
+
+// ============================================================
+// MAIN AGENT LOOP
+// ============================================================
+
+let nameRowId =
+    null;
+
+let completed =
+    false;
+
+
+try {
+
+    // --------------------------------------------------------
+    // GEMINI KEY
+    // --------------------------------------------------------
+
+    if (!GEMINI_API_KEY) {
+
+        at.toast(
+            "Không đọc được Gemini key từ " +
+            KEY_FILE,
+            6
+        );
+
+        throw new Error(
+            "Thiếu GEMINI_API_KEY"
+        );
+    }
+
+
+    // --------------------------------------------------------
+    // DATA
+    // --------------------------------------------------------
+
+    const phone =
+        getPhone();
+
+
+    const password =
+        getPassword();
+
+
+    // --------------------------------------------------------
+    // SUPABASE NAME
+    // --------------------------------------------------------
+
+    at.toast(
+        "Đang lấy Họ Tên...",
+        2
+    );
+
+
+    const nameResult =
+        getUnusedName();
+
+
+    nameRowId =
+        nameResult.id;
+
+
+    console.log(
+        "Họ Tên: " +
+        nameResult.ho +
+        " " +
+        nameResult.ten
+    );
+
+
+    // --------------------------------------------------------
+    // INFO
+    // --------------------------------------------------------
+
+    INFO =
+        "Họ: " +
+        nameResult.ho +
+        "\n" +
+
+        "Tên: " +
+        nameResult.ten +
+        "\n" +
+
+        "Ngày sinh: 15/06/1995" +
+        "\n" +
+
+        "Số di động: " +
+        phone +
+        "\n" +
+
+        "Mật khẩu: " +
+        password;
+
+
+    // --------------------------------------------------------
+    // PASSWORD STATE
+    // --------------------------------------------------------
+
+    passwordTyped =
+        false;
+
+
+    at.toast(
+        "Đã chuẩn bị dữ liệu",
+        2
+    );
+
+
+    // --------------------------------------------------------
+    // HISTORY
+    // --------------------------------------------------------
+
+    const history = [];
+
+
+    let lastSignature =
+        "";
+
+    let repeat =
+        0;
+
+
+    // ========================================================
+    // AGENT LOOP
+    // ========================================================
+
+    for (
+        let step = 1;
+        step <= MAX_STEPS;
+        step++
+    ) {
+
+        at.toast(
+            "Bước " +
+            step +
+            "/" +
+            MAX_STEPS,
+            1
+        );
+
+
+        const out =
+            runStep(
+                history
+            );
+
+
+        if (
+            out.stop
+        ) {
+
+            if (
+                out.completed
+            ) {
+
+                completed =
+                    true;
+            }
+
+            break;
+        }
+
+
+        // ----------------------------------------------------
+        // HISTORY
+        // ----------------------------------------------------
+
+        if (
+            out.note
+        ) {
+
+            history.push(
+                step +
+                ". " +
+                out.note
+            );
+        }
+
+
+        if (
+            history.length > 10
+        ) {
+
+            history.shift();
+        }
+
+
+        // ----------------------------------------------------
+        // REPEAT DETECTION
+        // ----------------------------------------------------
+
+        if (
+            out.signature ===
+            lastSignature
+        ) {
+
+            repeat++;
+
+        } else {
+
+            repeat = 1;
+
+            lastSignature =
+                out.signature;
+        }
+
+
+        // ----------------------------------------------------
+        // PASSWORD SPECIAL CASE
+        // ----------------------------------------------------
+        //
+        // Nếu server cố yêu cầu password
+        // lần thứ 2 liên tiếp, không stop ngay.
+        //
+        // Cho server thêm một vòng screenshot
+        // để nhận biết password đã nhập.
+        //
+        // ----------------------------------------------------
+
+        if (
+            repeat >= MAX_REPEAT &&
+            out.signature !== "wait" &&
+            out.signature !==
+                "password-already-typed"
+        ) {
+
+            at.toast(
+                "Dừng: hành động lặp " +
+                repeat +
+                " lần",
+                5
+            );
+
+            break;
+        }
+
+
+        // ----------------------------------------------------
+        // SETTLE
+        // ----------------------------------------------------
+
+        wait(
+            SETTLE_MS
+        );
+
+
+        if (
+            step === MAX_STEPS
+        ) {
+
+            at.toast(
+                "Đã đạt MAX_STEPS",
+                4
+            );
+        }
+    }
+
+
+    // ========================================================
+    // MARK NAME USED
+    // ========================================================
+
+    // Chỉ đánh dấu tên khi server/AI báo DONE.
+    if (
+        completed &&
+        nameRowId
+    ) {
+
+        try {
+
+            markNameUsed(
+                nameRowId
+            );
+
+            console.log(
+                "Đã đánh dấu tên đã dùng."
+            );
+
+        } catch (markError) {
+
+            console.log(
+                "[WARN] Không mark được tên: " +
+                safeString(
+                    markError.message ||
+                    markError
+                )
+            );
+        }
+    }
+
+
+} catch (e) {
+
+    at.toast(
+        "Lỗi: " +
+        safeString(
+            e.message || e
+        ).substring(
+            0,
+            180
+        ),
+        6
+    );
+
+
+    console.log(
+        "[FATAL] " +
+        safeString(
+            e.message || e
+        )
+    );
+
+
+} finally {
 
     try {
-      data = JSON.parse(raw);
-    } catch (_) {
-      throw new Error("Invalid Gemini HTTP JSON.");
-    }
 
-    const text = data?.candidates?.[0]?.content?.parts
-      ?.map((part) => part?.text || "")
-      .join("")
-      .trim();
+        at.stop();
 
-    if (!text) {
-      throw new Error("Gemini returned empty content.");
-    }
-
-    return parseJsonLoose(text);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// ============================================================
-// RESPONSE
-// ============================================================
-
-function buildResponse({
-  brain,
-  width,
-  height,
-  success = true,
-  transient = false,
-  validationErrors = [],
-  requestError = null,
-}) {
-  const payload = toPixelAction(brain, width, height);
-
-  return {
-    success,
-    transient,
-
-    state: brain.state,
-    confidence: brain.confidence,
-    observations: brain.observations,
-    diagnosis: brain.diagnosis,
-    decision: brain.decision,
-    expected_result: brain.expected_result,
-
-    // action phẳng ở cấp trên cùng (hợp đồng AutoTouch).
-    ...payload,
-
-    purpose: brain.purpose || payload.purpose || "",
-    reason: brain.reason || payload.reason || "",
-
-    validation_errors: validationErrors,
-    error: requestError,
-    brain_id: crypto.randomUUID(),
-  };
-}
-
-function safeEqual(a, b) {
-  const ba = Buffer.from(String(a || ""));
-  const bb = Buffer.from(String(b || ""));
-
-  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
-}
-
-// ============================================================
-// MAIN
-// ============================================================
-
-export default async function handler(req, res) {
-  const reply = (brain, extra = {}, width = 375, height = 812) =>
-    res.status(200).json(buildResponse({ brain, width, height, ...extra }));
-
-  if (req.method !== "POST") {
-    return reply(fallbackAction("Method not allowed."), {
-      success: false,
-      validationErrors: ["METHOD_NOT_ALLOWED"],
-    });
-  }
-
-  // Khóa bí mật (tùy chọn): chỉ bật khi đặt biến môi trường ANALYZE_SECRET.
-  if (ANALYZE_SECRET && !safeEqual(req.headers["x-api-secret"], ANALYZE_SECRET)) {
-    return res.status(401).json({
-      success: false,
-      action: "fail",
-      reason: "Unauthorized",
-    });
-  }
-
-  try {
-    const body = req.body || {};
-
-    const { image, goal, info, rules, history, mode, failure } = body;
-
-    const width = Number(body.width ?? body.screenWidth ?? 375) || 375;
-    const height = Number(body.height ?? body.screenHeight ?? 812) || 812;
-
-    // Gemini key do AutoTouch gửi lên (header ưu tiên), fallback về env.
-    const geminiKey = String(
-      req.headers["x-gemini-key"] || body.geminiKey || ENV_GEMINI_API_KEY || ""
-    ).trim();
-
-    if (!geminiKey) {
-      return reply(
-        {
-          ...fallbackAction("Missing Gemini API key. Set GEMINI_KEY in the AutoTouch script."),
-          action: "fail",
-          purpose: "config",
-        },
-        { success: false, validationErrors: ["MISSING_GEMINI_KEY"] },
-        width,
-        height
-      );
-    }
-
-    if (!image) {
-      return reply(
-        fallbackAction("Missing screenshot image.", { transient: true }),
-        { success: false, transient: true, validationErrors: ["MISSING_IMAGE"] },
-        width,
-        height
-      );
-    }
-
-    const normalizedHistory = normalizeHistory(history);
-    const historyAnalysis = analyzeHistory(normalizedHistory);
-
-    const prompt = buildPrompt({
-      goal,
-      info,
-      rules,
-      mode,
-      failure,
-      width,
-      height,
-      history: normalizedHistory,
-      historyAnalysis,
-    });
-
-    // ----------------------------------------------------------
-    // GEMINI (chia sẻ ngân sách thời gian giữa các lần thử)
-    // ----------------------------------------------------------
-
-    const startedAt = Date.now();
-
-    let brain = null;
-    let lastError = null;
-
-    for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
-      const remaining = TOTAL_BUDGET_MS - (Date.now() - startedAt);
-
-      if (attempt > 0 && remaining < MIN_RETRY_MS) {
-        break;
-      }
-
-      try {
-        const raw = await callGemini({
-          apiKey: geminiKey,
-          image,
-          prompt,
-          model: attempt === 0 ? DEFAULT_MODEL : RECOVERY_MODEL,
-          timeoutMs: Math.max(1000, Math.min(TIMEOUT_MS, remaining)),
-        });
-
-        brain = normalizeBrain(raw);
-
-        break;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-
-    if (!brain) {
-      const message = lastError?.message || "Gemini unavailable.";
-
-      console.error("[GEMINI ERROR]", message);
-
-      return reply(
-        fallbackAction("Temporary Gemini/API failure. Wait and retry.", {
-          transient: true,
-          error: message,
-        }),
-        {
-          success: false,
-          transient: true,
-          validationErrors: ["GEMINI_TEMPORARY_ERROR"],
-          requestError: message,
-        },
-        width,
-        height
-      );
-    }
-
-    // ----------------------------------------------------------
-    // CANONICALIZE -> GUARDS -> VALIDATE
-    // ----------------------------------------------------------
-
-    brain = canonicalizeTyping(brain, info);
-    brain = applyStateGuards(brain, historyAnalysis);
-    brain = applyConfidenceGuard(brain);
-    brain = applyLoopGuard(brain, historyAnalysis);
-
-    const validationErrors = validateAction(brain, info, historyAnalysis);
-
-    if (validationErrors.length) {
-      const errorText = validationErrors.join(" | ");
-
-      console.warn("[ACTION VALIDATION]", errorText);
-
-      const fallback = fallbackAction(
-        `Validation rejected Gemini action: ${errorText}`,
-        { transient: true }
-      );
-
-      // Giữ lại chẩn đoán của Gemini để dễ debug.
-      fallback.state = brain.state;
-      fallback.confidence = brain.confidence;
-      fallback.observations = brain.observations;
-      fallback.diagnosis = brain.diagnosis || fallback.diagnosis;
-      fallback.decision = brain.decision || fallback.decision;
-      fallback.expected_result = brain.expected_result || fallback.expected_result;
-
-      return reply(
-        fallback,
-        {
-          success: false,
-          transient: true,
-          validationErrors,
-          requestError: errorText,
-        },
-        width,
-        height
-      );
-    }
-
-    return reply(
-      brain,
-      { success: true, transient: false, validationErrors: [] },
-      width,
-      height
-    );
-  } catch (error) {
-    const message = error?.message || "Internal server error.";
-
-    console.error("[ANALYZE ERROR]", message);
-
-    return reply(
-      fallbackAction("Temporary server error. Wait and retry.", {
-        transient: true,
-        error: message,
-      }),
-      {
-        success: false,
-        transient: true,
-        validationErrors: ["INTERNAL_SERVER_ERROR"],
-        requestError: message,
-      }
-    );
-  }
+    } catch (e2) {}
 }
